@@ -1,0 +1,177 @@
+name: ReadCodebase
+mode: PermReadOnly
+commands: 
+  - command: ls
+  - command: cat
+  - command: head
+  - command: tail
+  - command: wc
+  - command: file
+  - command: stat
+  - command: grep
+  - command: rg
+  - command: find
+    mode: deny
+    disallowed_args:
+      - "-exec"
+      - "-delete"
+  - command: diff
+  - command: sort
+  - command: uniq
+  - command: cut
+  - command: tr
+  - command: ps
+  - command: df
+  - command: du
+  - command: uname
+  - command: whoami
+  - command: date
+  - command: git
+    mode: allow
+    allowed_args:
+      - arg: "log"
+      - arg: "ls-files"
+      - arg: "show"
+      - arg: "diff"
+      - arg: "blame"
+      - regex: "^[A-Za-z0-9-_]+.go$"
+      - pathSpec: "./*"
+description: |
+  # Agentic Codebase Analysis: A Read-Only Command Playbook
+
+  How an LLM agent should investigate a codebase in response to a user prompt, using only this allowed command set:
+
+  `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `grep`, `rg`, `find`, `diff`, `sort`, `uniq`, `cut`, `tr`, `ps`, `df`, `du`, `uname`, `whoami`, `date`, `git` (read-only subcommands).
+
+  Note: `tree` and `sed` are unavailable — use `find` or `ls -R` for directory structure, and `head`/`tail` combinations for line ranges.
+
+  ## The core loop
+
+  1. **Orient** — understand the repo's shape and language before reading anything specific.
+  2. **Locate** — narrow from "the whole repo" to "the few files that matter" via search.
+  3. **Read** — open those files and trace what they do.
+  4. **Verify** — cross-check against git history, tests, or call sites.
+  5. **Report** — synthesize with file paths and line numbers so the user can verify.
+
+  Skipping step 1 is the most common failure: agents that `grep` for the user's keyword immediately often miss that the codebase uses different terminology or that the answer is in the README.
+
+  ## Step 1: Orient
+
+  Cheap, high-signal commands to build a mental map:
+
+  ```bash
+  ls -la                                   # what's at the root?
+  cat README.md                            # what does the project say it is?
+  cat package.json                         # or pyproject.toml, Cargo.toml, go.mod
+  find . -maxdepth 2 -type d               # directory shape, 2 levels deep
+  git ls-files | head -50                  # tracked files (skips build artifacts)
+  git log --oneline -20                    # recent activity
+  ```
+
+  The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. `git ls-files` beats `find` for "what's in this project" because it respects `.gitignore`. If you need a deeper directory view without `tree`, use `find . -maxdepth 3 -type d | sort`.
+
+  ## Step 2: Locate
+
+  Search is cheap, reading is expensive. Run several targeted searches before opening files. Default to `rg`; fall back to `grep -rn` if unavailable.
+
+  ```bash
+  rg "PaymentProcessor"                    # all references
+  rg -l "PaymentProcessor"                 # just file list
+  rg -t py "class.*Processor"              # restrict by type
+  rg -A 5 -B 2 "def process_payment"       # context lines
+  ```
+
+  Strategy by question type:
+
+  - **"Where is X defined?"** → `rg "(class|def|function|fn)\s+X"`
+  - **"Where is X used?"** → `rg "\bX\b"` with word boundaries
+  - **"How does auth work?"** → search the *concept*: `rg -i "auth|login|session|token"`. Cast wide, then narrow.
+  - **"What configures Y?"** → `find . -name '*.yaml' -o -name '*.toml' -o -name 'config.*'`, then grep within.
+  - **"What broke in feature Z?"** → `git log -S "string"` (the pickaxe — finds commits adding/removing that string).
+
+  If the obvious search returns nothing, the codebase doesn't use that term. Try synonyms (`auth`, `login`, `signin`, `credentials`) or check imports for clues about which library handles it.
+
+  Combining with `sort`/`uniq`/`cut` is useful for summaries — e.g., `rg -l "TODO" | cut -d/ -f2 | sort | uniq -c | sort -rn` shows which top-level directory has the most TODOs.
+
+  ## Step 3: Read
+
+  Don't `cat` a 3000-line file when you need one function.
+
+  ```bash
+  wc -l path/to/file.py                    # check size first
+  head -50 path/to/file.py                 # imports and structure
+  head -180 path/to/file.py | tail -60     # lines 121-180 (no sed available)
+  rg -n "def process_payment" -A 40 path/to/file.py   # function + body
+  ```
+
+  Since `sed` isn't available, `head -N | tail -M` is your range-reading tool: to read lines A through B, use `head -B file | tail -(B-A+1)`. Always check imports at the top first — they reveal dependencies and where related code lives, often faster than another search.
+
+  To trace call paths, alternate "where defined?" with "who calls?":
+
+  ```bash
+  rg -n "def authenticate"                 # definition
+  rg -n "authenticate\("                   # call sites
+  rg -n "import authenticate"              # who imports it
+  ```
+
+  ## Step 4: Verify
+
+  Before reporting, sanity-check. Agents readily describe how code "works" based on names and comments without confirming behavior.
+
+  ```bash
+  git log --oneline -- path/to/file.py     # is this code current?
+  git blame path/to/file.py | head -30     # who wrote it, when?
+  git log -p -S "function_name"            # when added/changed and why
+  find . -path '*/test*' -name '*payment*' # tests document intended behavior
+  diff old_version.py new_version.py       # compare two files directly
+  ```
+
+  Tests beat docstrings — they execute. If your conclusion contradicts the tests, your conclusion is probably wrong.
+
+  ## Step 5: Report
+
+  Ground every claim in a file path and line number.
+
+  ✅ "Authentication is handled in `src/auth/session.py:42` by `SessionManager.authenticate()`. It validates credentials against the user store in `src/auth/store.py`, then issues a JWT using the secret from `config/auth.yaml`. Tests at `tests/auth/test_session.py:15-80`."
+
+  ❌ "The codebase uses a SessionManager class to handle authentication with JWTs."
+
+  Both might be true; only the first is verifiable.
+
+  ## Worked example: "How does this app handle file uploads?"
+
+  **Orient.** `ls`, `cat README.md`, `cat package.json`. It's an Express.js app with `multer` (a Node upload library) as a dependency — strong lead.
+
+  **Locate.** `rg -l "multer"` → `src/middleware/upload.js`, `src/routes/files.js`, `tests/upload.test.js`. `rg -l "upload"` adds `src/services/storage.js`.
+
+  **Read.** `cat src/middleware/upload.js` (~40 lines per `wc -l`, fine to read whole). For `src/routes/files.js` (320 lines), use `rg -n "upload" -A 20 src/routes/files.js` to see only upload routes.
+
+  **Verify.** `cat tests/upload.test.js` confirms behavior. `git log --oneline -- src/middleware/upload.js` shows it was touched two weeks ago — current.
+
+  **Report.** "Uploads are handled by multer middleware in `src/middleware/upload.js`, limited to 10MB images (line 12). Routes in `src/routes/files.js:45-80` invoke this middleware and pass files to `StorageService.persist()` in `src/services/storage.js`, which writes to S3. Tests in `tests/upload.test.js` cover size limits, MIME validation, and S3 failures."
+
+  ## Anti-patterns
+
+  - **Searching before orienting.** Always check the manifest and directory structure first.
+  - **Reading whole files when you need a function.** `wc -l` first, then `rg -n` with `-A`/`-B`.
+  - **Trusting comments over code.** Comments lie, docstrings stale. Prefer code, tests, and recent commits.
+  - **One search, one conclusion.** Cross-reference with call sites, tests, and git history.
+  - **Reporting without paths.** If you can't cite it, you don't know it.
+  - **Forgetting `.gitignore`.** Prefer `rg` and `git ls-files` over raw `find`/`grep -r` to avoid swamping in build artifacts.
+
+  ## Quick reference
+
+  | Purpose | Primary | Notes |
+  |---|---|---|
+  | List files | `git ls-files`, `ls -la` | `find . -maxdepth N -type f` for broader |
+  | Directory shape | `find . -maxdepth 2 -type d \| sort` | No `tree` available |
+  | Search content | `rg` | Fall back to `grep -rn` |
+  | Read whole file | `cat` (small only) | `wc -l` first to check size |
+  | Read a range | `head -B file \| tail -(B-A+1)` | No `sed` available |
+  | File size/info | `wc -l`, `stat`, `file` | — |
+  | History | `git log`, `git log -S`, `git blame` | — |
+  | Diff a change | `git show <sha>`, `git diff`, `diff` | — |
+  | Find tests | `find . -path '*test*'` | — |
+  | Summarize matches | `rg -l ... \| cut \| sort \| uniq -c` | Useful for hotspot analysis |
+
+  Most codebase questions resolve in 5-15 commands when the loop is followed. Agents flailing through 50+ commands are usually skipping step 1 or step 4.
