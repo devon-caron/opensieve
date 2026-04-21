@@ -1,20 +1,17 @@
 package tool
 
-import "github.com/devon-caron/opensieve/permissions"
-
 type ToolSpec struct {
 	// Name uniquely identifies the tool inside a Registry. Workspace
 	// tools intentionally collide with global tools by name to shadow
 	// them.
-	Name string
+	Name string `yaml:"name"`
 
 	// Description is the LLM-facing blurb explaining what the tool
 	// does. Required.
-	Description string
+	Description string `yaml:"description"`
 
-	// Mode is the tier the tool sits at. The tool is reachable when
-	// the active session mode is >= Mode.
-	Mode permissions.PermMode
+	// Environment variables the tool needs to run.
+	Env []string `yaml:"env"`
 
 	// Commands lists the shell commands a user tool will execute.
 	// Empty for native tools and for "data-shape" user tools that
@@ -22,21 +19,29 @@ type ToolSpec struct {
 	//
 	// Required to be empty when Mode == PermDenyAll for user tools —
 	// the loader and Registry.Register both enforce this.
-	Commands []Command
+	Commands []Command `yaml:"commands"`
 }
 
 type CommandMode string
 
 const (
-	CommandModeAllow CommandMode = "allow"
-	CommandModeDeny  CommandMode = "deny"
+	CommandModeWhitelist CommandMode = "whitelist"
+	CommandModeBlacklist CommandMode = "blacklist"
 )
 
 type Command struct {
 	Command string `yaml:"command"`
 
-	// Mode is the tier the command sits at. The command is reachable when
-	// the active session mode is >= Mode.
+	// Subcommands are promoted versions of arguments, in cases where subcommands
+	// are featured enough to deserve their own set of permissions.
+	// Crucially, any permissions on the parent do NOT apply to the subcommands.
+	// Subcommands must define their own allows/denies.
+	// If a subcommand is defined, it will be allowed regardless of the parent's command mode.
+	Subcommands []Command `yaml:"subcommands"`
+
+	// Mode is the permission that determines if the AllowedArgs or DisallowedArgs list
+	// is used. If Mode is "whitelist", only the arguments whitelisted in AllowedArgs are allowed.
+	// If Mode is "blacklist", all arguments except those blacklisted in DisallowedArgs are allowed.
 	Mode CommandMode `yaml:"mode"`
 
 	// AllowedArgs is a list of arguments that are allowed to be used with the command.
@@ -44,10 +49,18 @@ type Command struct {
 
 	// DisallowedArgs is a list of arguments that are not allowed to be used with the command.
 	DisallowedArgs []Argument `yaml:"disallowed_args,omitempty"`
+
+	// RequiredArgs is a list of arguments that must be provided with the command. Supplied in order presented in YAML.
+	RequiredArgs []Argument `yaml:"required_args,omitempty"`
 }
 
 type Argument struct {
-	Arg      string `yaml:"arg,omitempty"`
+	// Specific string value to allow/disallow.
+	Arg string `yaml:"arg,omitempty"`
+
+	// Path specification to allow/disallow (e.g., "*.go" or "/tmp/*").
 	PathSpec string `yaml:"path_spec,omitempty"`
-	Regex    string `yaml:"regex"`
+
+	// Regular expression to match arguments to allow/disallow.
+	Regex string `yaml:"regex"`
 }
