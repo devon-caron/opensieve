@@ -1,41 +1,4 @@
 name: ReadCodebase
-mode: PermReadOnly
-commands: 
-  - command: ls
-  - command: cat
-  - command: head
-  - command: tail
-  - command: wc
-  - command: file
-  - command: stat
-  - command: grep
-  - command: rg
-  - command: find
-    mode: deny
-    disallowed_args:
-      - "-exec"
-      - "-delete"
-  - command: diff
-  - command: sort
-  - command: uniq
-  - command: cut
-  - command: tr
-  - command: ps
-  - command: df
-  - command: du
-  - command: uname
-  - command: whoami
-  - command: date
-  - command: git
-    mode: allow
-    allowed_args:
-      - arg: "log"
-      - arg: "ls-files"
-      - arg: "show"
-      - arg: "diff"
-      - arg: "blame"
-      - regex: "^[A-Za-z0-9-_]+.go$"
-      - pathSpec: "./*"
 description: |
   # Agentic Codebase Analysis: A Read-Only Command Playbook
 
@@ -64,8 +27,8 @@ description: |
   cat README.md                            # what does the project say it is?
   cat package.json                         # or pyproject.toml, Cargo.toml, go.mod
   find . -maxdepth 2 -type d               # directory shape, 2 levels deep
-  git ls-files | head -50                  # tracked files (skips build artifacts)
-  git log --oneline -20                    # recent activity
+  git --no-pager ls-files | head -50       # tracked files (skips build artifacts)
+  git --no-pager log --oneline -20         # recent activity
   ```
 
   The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. `git ls-files` beats `find` for "what's in this project" because it respects `.gitignore`. If you need a deeper directory view without `tree`, use `find . -maxdepth 3 -type d | sort`.
@@ -87,7 +50,7 @@ description: |
   - **"Where is X used?"** → `rg "\bX\b"` with word boundaries
   - **"How does auth work?"** → search the *concept*: `rg -i "auth|login|session|token"`. Cast wide, then narrow.
   - **"What configures Y?"** → `find . -name '*.yaml' -o -name '*.toml' -o -name 'config.*'`, then grep within.
-  - **"What broke in feature Z?"** → `git log -S "string"` (the pickaxe — finds commits adding/removing that string).
+  - **"What broke in feature Z?"** → `git --no-pager log -S "string"` (the pickaxe — finds commits adding/removing that string).
 
   If the obvious search returns nothing, the codebase doesn't use that term. Try synonyms (`auth`, `login`, `signin`, `credentials`) or check imports for clues about which library handles it.
 
@@ -119,11 +82,11 @@ description: |
   Before reporting, sanity-check. Agents readily describe how code "works" based on names and comments without confirming behavior.
 
   ```bash
-  git log --oneline -- path/to/file.py     # is this code current?
-  git blame path/to/file.py | head -30     # who wrote it, when?
-  git log -p -S "function_name"            # when added/changed and why
-  find . -path '*/test*' -name '*payment*' # tests document intended behavior
-  diff old_version.py new_version.py       # compare two files directly
+  git --no-pager log --oneline -- path/to/file.py     # is this code current?
+  git --no-pager blame path/to/file.py | head -30     # who wrote it, when?
+  git --no-pager log -p -S "function_name"            # when added/changed and why
+  find . -path '*/test*' -name '*payment*'            # tests document intended behavior
+  diff old_version.py new_version.py                  # compare two files directly
   ```
 
   Tests beat docstrings — they execute. If your conclusion contradicts the tests, your conclusion is probably wrong.
@@ -146,7 +109,7 @@ description: |
 
   **Read.** `cat src/middleware/upload.js` (~40 lines per `wc -l`, fine to read whole). For `src/routes/files.js` (320 lines), use `rg -n "upload" -A 20 src/routes/files.js` to see only upload routes.
 
-  **Verify.** `cat tests/upload.test.js` confirms behavior. `git log --oneline -- src/middleware/upload.js` shows it was touched two weeks ago — current.
+  **Verify.** `cat tests/upload.test.js` confirms behavior. `git --no-pager log --oneline -- src/middleware/upload.js` shows it was touched two weeks ago — current.
 
   **Report.** "Uploads are handled by multer middleware in `src/middleware/upload.js`, limited to 10MB images (line 12). Routes in `src/routes/files.js:45-80` invoke this middleware and pass files to `StorageService.persist()` in `src/services/storage.js`, which writes to S3. Tests in `tests/upload.test.js` cover size limits, MIME validation, and S3 failures."
 
@@ -175,3 +138,402 @@ description: |
   | Summarize matches | `rg -l ... \| cut \| sort \| uniq -c` | Useful for hotspot analysis |
 
   Most codebase questions resolve in 5-15 commands when the loop is followed. Agents flailing through 50+ commands are usually skipping step 1 or step 4.
+
+env:
+  # Pager scrubbing — prevents pager escapes (less `!` shell-out) and
+  # prevents pagers from blocking the agent loop.
+  - "GIT_PAGER=cat"
+  - "PAGER=cat"
+  # No interactive credential prompts.
+  - "GIT_TERMINAL_PROMPT=0"
+  # Neutralize user/system git config, which would otherwise let a
+  # compromised ~/.gitconfig inject aliases (git log -> !rm -rf /)
+  # or configure textconv/external diff drivers.
+  - "GIT_CONFIG_GLOBAL=/dev/null"
+  - "GIT_CONFIG_SYSTEM=/dev/null"
+  # Disable pathspec magic globally (:(attr:...), :(exclude), etc.).
+  # Defense in depth against hostile .gitattributes.
+  - "GIT_LITERAL_PATHSPECS=1"
+  # Don't contend on index.lock for read operations.
+  - "GIT_OPTIONAL_LOCKS=0"
+  # Predictable locale for text processing.
+  - "LANG=C.UTF-8"
+  - "LC_ALL=C.UTF-8"
+
+commands:
+  # ==================================================================
+  # find
+  # ==================================================================
+  # Blacklist mode: find is fundamentally safe except for actions that
+  # execute commands or write to files. Everything else — -name, -type,
+  # -path, -maxdepth, -print, -size, boolean operators — is permitted.
+  #
+  # NOTE: find's first positional args are starting paths. Path safety
+  # for those positionals is not enforced here; if needed, the parser
+  # must apply it out-of-band.
+  - command: find
+    mode: blacklist
+    disallowed_args:
+      # Command execution
+      - arg: "-exec"
+      - arg: "-execdir"
+      - arg: "-ok"
+      - arg: "-okdir"
+      # Deletion
+      - arg: "-delete"
+      # File writes (the -fprint family writes matches to a named file)
+      - arg: "-fprint"
+      - arg: "-fprint0"
+      - arg: "-fprintf"
+      - arg: "-fls"
+
+  # ==================================================================
+  # git
+  # ==================================================================
+  # WHITELIST MODE on the parent: only these top-level flags are
+  # permitted. Git's dangerous top-level flags are rejected by
+  # omission:
+  #   -c, -C, --exec-path, --git-dir, --work-tree, --namespace,
+  #   --config-env, --paginate/-p
+  # Each of these is an RCE or sandbox-escape vector. DO NOT add any
+  # to allowed_args without understanding the implications. The Env
+  # scrubbing above provides defense in depth but this whitelist is
+  # the primary gate.
+  #
+  # --no-pager is required on every invocation (enforced both here and
+  # on every subcommand, since required_args is a simple argv-contains
+  # check with no inheritance).
+  - command: git
+    mode: whitelist
+    allowed_args:
+      - arg: "--no-pager"
+      - arg: "--no-optional-locks"
+      - arg: "--version"
+    required_args:
+      - arg: "--no-pager"
+    subcommands:
+
+      # --------------------------------------------------------------
+      # git log
+      # --------------------------------------------------------------
+      - command: log
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          # Output redirection (writes to filesystem)
+          - regex: "^--output(=.*)?$"
+          # External diff drivers / textconv — these can invoke
+          # programs configured in repo-level .git/config or
+          # .gitattributes. The Env block neutralizes user/system
+          # config; these deny the flag form that would force them on.
+          - arg: "--ext-diff"
+          - arg: "--textconv"
+
+      # --------------------------------------------------------------
+      # git show
+      # --------------------------------------------------------------
+      - command: show
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - regex: "^--output(=.*)?$"
+          - arg: "--ext-diff"
+          - arg: "--textconv"
+
+      # --------------------------------------------------------------
+      # git diff
+      # --------------------------------------------------------------
+      - command: diff
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - regex: "^--output(=.*)?$"
+          - arg: "--ext-diff"
+          - arg: "--textconv"
+
+      # --------------------------------------------------------------
+      # git status
+      # --------------------------------------------------------------
+      # status has no known dangerous flags. Blacklist empty; any
+      # known-safe flag is permitted.
+      - command: status
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args: []
+
+      # --------------------------------------------------------------
+      # git blame
+      # --------------------------------------------------------------
+      # --contents=<file> reads an arbitrary file from disk and treats
+      # it as the blamed file's contents. Path-safety bypass; deny.
+      - command: blame
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - regex: "^--output(=.*)?$"
+          - regex: "^--contents(=.*)?$"
+          - arg: "--textconv"
+
+      # --------------------------------------------------------------
+      # git ls-files
+      # --------------------------------------------------------------
+      # -X / --exclude-from=<file> reads exclude patterns from an
+      # arbitrary file. Not a direct RCE vector but lets the agent
+      # feed ls-files any path on disk; deny for consistency with
+      # the "agent doesn't reach outside the repo root" principle.
+      - command: ls-files
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - regex: "^--exclude-from(=.*)?$"
+          - arg: "-X"
+
+      # --------------------------------------------------------------
+      # git rev-parse
+      # --------------------------------------------------------------
+      # rev-parse is fundamentally informational (resolves refs to
+      # SHAs, reports repo metadata). The one flag worth denying is
+      # --parseopt, which changes rev-parse into a general-purpose
+      # option parser and is hard to reason about in a constrained
+      # context. --sq-quote is safe but niche.
+      - command: rev-parse
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - arg: "--parseopt"
+
+      # --------------------------------------------------------------
+      # git grep
+      # --------------------------------------------------------------
+      # -O / --open-files-in-pager=<cmd> runs <cmd> on every matching
+      # file — arbitrary command execution. Deny every form.
+      # --textconv is denied as elsewhere.
+      - command: grep
+        mode: blacklist
+        required_args:
+          - arg: "--no-pager"
+        disallowed_args:
+          - regex: "^-O.*$"
+          - regex: "^--open-files-in-pager(=.*)?$"
+          - arg: "--textconv"
+          - arg: "--ext-grep"
+  
+  # [... find and git entries above, unchanged ...]
+
+  # ==================================================================
+  # ls
+  # ==================================================================
+  # ls is safe; no flags execute code or write files. Blacklist empty.
+  - command: ls
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # cat
+  # ==================================================================
+  # cat reads files to stdout. Every flag is cosmetic (-A, -n, -b, -E,
+  # -T, -v, -s). Path safety is the real concern, handled out-of-band.
+  - command: cat
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # head
+  # ==================================================================
+  # head has no dangerous flags. Empty blacklist.
+  - command: head
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # tail
+  # ==================================================================
+  # -f / --follow blocks the agent loop waiting for new data. -F is
+  # shorthand for --follow=name --retry, same problem. --retry alone
+  # also implies follow behavior. Deny all forms.
+  - command: tail
+    mode: blacklist
+    disallowed_args:
+      - arg: "-f"
+      - arg: "-F"
+      - arg: "--follow"
+      - regex: "^--follow=.*$"
+      - arg: "--retry"
+
+  # ==================================================================
+  # wc
+  # ==================================================================
+  # wc is safe. --files0-from reads a filename list from an arbitrary
+  # file; not an RCE but bypasses path policy if the caller enforces
+  # it on positional args only. Deny for consistency.
+  - command: wc
+    mode: blacklist
+    disallowed_args:
+      - regex: "^--files0-from(=.*)?$"
+
+  # ==================================================================
+  # file
+  # ==================================================================
+  # file identifies file types. -C compiles magic files (write op on
+  # some systems) and -m uses a custom magic file. Deny both.
+  - command: file
+    mode: blacklist
+    disallowed_args:
+      - arg: "-C"
+      - arg: "--compile"
+      - arg: "-m"
+      - regex: "^--magic-file(=.*)?$"
+
+  # ==================================================================
+  # stat
+  # ==================================================================
+  # stat is purely informational. No dangerous flags.
+  - command: stat
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # grep
+  # ==================================================================
+  # grep is safe. -f/--file reads patterns from an arbitrary file;
+  # --include-from / --exclude-from likewise. Deny the file-reading
+  # forms for path-policy consistency. No RCE flags in GNU grep.
+  - command: grep
+    mode: blacklist
+    disallowed_args:
+      - regex: "^-f.*$"
+      - regex: "^--file(=.*)?$"
+      - regex: "^--include-from(=.*)?$"
+      - regex: "^--exclude-from(=.*)?$"
+
+  # ==================================================================
+  # rg (ripgrep)
+  # ==================================================================
+  # --pre=<cmd> runs <cmd> as a preprocessor on every matched file:
+  # arbitrary command execution. --hostname-bin=<cmd> runs <cmd> to
+  # determine the hostname. Both are direct RCE vectors.
+  # -z / --search-zip invokes external decompressors; lower risk but
+  # deny. File-list flags read arbitrary paths; deny for consistency.
+  - command: rg
+    mode: blacklist
+    disallowed_args:
+      - arg: "--pre"
+      - regex: "^--pre=.*$"
+      - arg: "--hostname-bin"
+      - regex: "^--hostname-bin=.*$"
+      - arg: "-z"
+      - arg: "--search-zip"
+      - arg: "-f"
+      - regex: "^--file=.*$"
+      - regex: "^--ignore-file=.*$"
+
+  # ==================================================================
+  # diff
+  # ==================================================================
+  # diff itself is safe. --to-file / --from-file take alternate paths
+  # that could bypass path policy; deny. No RCE flags.
+  - command: diff
+    mode: blacklist
+    disallowed_args:
+      - regex: "^--to-file(=.*)?$"
+      - regex: "^--from-file(=.*)?$"
+
+  # ==================================================================
+  # sort
+  # ==================================================================
+  # -o / --output writes to a file. --compress-program=<cmd> runs
+  # <cmd> on temp files — RCE. --files0-from reads a file list.
+  - command: sort
+    mode: blacklist
+    disallowed_args:
+      - arg: "-o"
+      - regex: "^--output(=.*)?$"
+      - arg: "--compress-program"
+      - regex: "^--compress-program=.*$"
+      - regex: "^--files0-from(=.*)?$"
+
+  # ==================================================================
+  # uniq
+  # ==================================================================
+  # uniq is safe.
+  - command: uniq
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # cut
+  # ==================================================================
+  # cut is safe.
+  - command: cut
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # tr
+  # ==================================================================
+  # tr is safe — reads stdin, writes stdout, no file access.
+  - command: tr
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # ps
+  # ==================================================================
+  # ps is an information-leak concern (other users' command lines may
+  # contain secrets) but has no flags that execute code or write.
+  # Leakage is handled by process-namespace isolation in the sandbox,
+  # not here.
+  - command: ps
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # df
+  # ==================================================================
+  # df is safe.
+  - command: df
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # du
+  # ==================================================================
+  # du is safe. --files0-from reads a file list; deny for consistency.
+  - command: du
+    mode: blacklist
+    disallowed_args:
+      - regex: "^--files0-from(=.*)?$"
+
+  # ==================================================================
+  # uname
+  # ==================================================================
+  # uname is purely informational.
+  - command: uname
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # whoami
+  # ==================================================================
+  # whoami takes no meaningful arguments.
+  - command: whoami
+    mode: blacklist
+    disallowed_args: []
+
+  # ==================================================================
+  # date
+  # ==================================================================
+  # -s / --set sets the system clock. Requires root in practice but
+  # deny regardless.
+  - command: date
+    mode: blacklist
+    disallowed_args:
+      - arg: "-s"
+      - regex: "^--set(=.*)?$"
