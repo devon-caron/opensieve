@@ -20,143 +20,108 @@ description: |
 
   ## Step 1: Orient
 
-  Cheap, high-signal commands to build a mental map:
-
   ```bash
-  ls -la                                   # what's at the root?
-  cat README.md                            # what does the project say it is?
+  ls -la
+  cat README.md
   cat package.json                         # or pyproject.toml, Cargo.toml, go.mod
-  find . -maxdepth 2 -type d               # directory shape, 2 levels deep
-  git --no-pager ls-files | head -50       # tracked files (skips build artifacts)
-  git --no-pager log --oneline -20         # recent activity
+  find . -maxdepth 2 -type d
+  git --no-pager ls-files | head -50
+  git --no-pager log --oneline -20
   ```
 
-  The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. `git ls-files` beats `find` for "what's in this project" because it respects `.gitignore`. If you need a deeper directory view without `tree`, use `find . -maxdepth 3 -type d | sort`.
+  The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. `git ls-files` beats `find` for "what's in this project" because it respects `.gitignore`.
 
   ## Step 2: Locate
 
-  Search is cheap, reading is expensive. Run several targeted searches before opening files. Default to `rg`; fall back to `grep -rn` if unavailable.
-
   ```bash
-  rg "PaymentProcessor"                    # all references
-  rg -l "PaymentProcessor"                 # just file list
-  rg -t py "class.*Processor"              # restrict by type
-  rg -A 5 -B 2 "def process_payment"       # context lines
+  rg "PaymentProcessor"
+  rg -l "PaymentProcessor"
+  rg -t py "class.*Processor"
+  rg -A 5 -B 2 "def process_payment"
   ```
 
   Strategy by question type:
 
   - **"Where is X defined?"** → `rg "(class|def|function|fn)\s+X"`
   - **"Where is X used?"** → `rg "\bX\b"` with word boundaries
-  - **"How does auth work?"** → search the *concept*: `rg -i "auth|login|session|token"`. Cast wide, then narrow.
-  - **"What configures Y?"** → `find . -name '*.yaml' -o -name '*.toml' -o -name 'config.*'`, then grep within.
-  - **"What broke in feature Z?"** → `git --no-pager log -S "string"` (the pickaxe — finds commits adding/removing that string).
+  - **"How does auth work?"** → `rg -i "auth|login|session|token"`. Cast wide, then narrow.
+  - **"What configures Y?"** → `find . -name '*.yaml' -o -name '*.toml'`, then grep within.
+  - **"What broke in feature Z?"** → `git --no-pager log -S "string"` (pickaxe).
 
-  If the obvious search returns nothing, the codebase doesn't use that term. Try synonyms (`auth`, `login`, `signin`, `credentials`) or check imports for clues about which library handles it.
-
-  Combining with `sort`/`uniq`/`cut` is useful for summaries — e.g., `rg -l "TODO" | cut -d/ -f2 | sort | uniq -c | sort -rn` shows which top-level directory has the most TODOs.
+  Hotspots: `rg -l "TODO" | cut -d/ -f2 | sort | uniq -c | sort -rn`.
 
   ## Step 3: Read
 
-  Don't `cat` a 3000-line file when you need one function.
-
   ```bash
-  wc -l path/to/file.py                    # check size first
-  head -50 path/to/file.py                 # imports and structure
-  head -180 path/to/file.py | tail -60     # lines 121-180 (no sed available)
-  rg -n "def process_payment" -A 40 path/to/file.py   # function + body
+  wc -l path/file.py                       # size first
+  head -50 path/file.py                    # imports + structure
+  head -180 path/file.py | tail -60        # lines 121-180
+  rg -n "def process_payment" -A 40 path/file.py
   ```
 
-  Since `sed` isn't available, `head -N | tail -M` is your range-reading tool: to read lines A through B, use `head -B file | tail -(B-A+1)`. Always check imports at the top first — they reveal dependencies and where related code lives, often faster than another search.
-
-  To trace call paths, alternate "where defined?" with "who calls?":
-
-  ```bash
-  rg -n "def authenticate"                 # definition
-  rg -n "authenticate\("                   # call sites
-  rg -n "import authenticate"              # who imports it
-  ```
+  No `sed`: use `head -B | tail -(B-A+1)` for ranges. Read imports first — reveals related code faster than another search. Trace calls by alternating `rg -n "def X"`, `rg -n "X\("`, `rg -n "import X"`.
 
   ## Step 4: Verify
 
-  Before reporting, sanity-check. Agents readily describe how code "works" based on names and comments without confirming behavior.
-
   ```bash
-  git --no-pager log --oneline -- path/to/file.py     # is this code current?
-  git --no-pager blame path/to/file.py | head -30     # who wrote it, when?
-  git --no-pager log -p -S "function_name"            # when added/changed and why
-  find . -path '*/test*' -name '*payment*'            # tests document intended behavior
-  diff old_version.py new_version.py                  # compare two files directly
+  git --no-pager log --oneline -- path/file.py
+  git --no-pager blame path/file.py | head -30
+  git --no-pager log -p -S "function_name"
+  find . -path '*/test*' -name '*payment*'
+  diff old.py new.py
   ```
 
-  Tests beat docstrings — they execute. If your conclusion contradicts the tests, your conclusion is probably wrong.
+  Tests beat docstrings — they execute. Contradicts your conclusion? You're wrong.
 
   ## Step 5: Report
 
-  Ground every claim in a file path and line number.
+  Cite path and line for every claim.
 
-  ✅ "Authentication is handled in `src/auth/session.py:42` by `SessionManager.authenticate()`. It validates credentials against the user store in `src/auth/store.py`, then issues a JWT using the secret from `config/auth.yaml`. Tests at `tests/auth/test_session.py:15-80`."
+  ✅ "Auth in `src/auth/session.py:42` via `SessionManager.authenticate()`; validates against `src/auth/store.py`; JWT from `config/auth.yaml`. Tests: `tests/auth/test_session.py:15-80`."
 
-  ❌ "The codebase uses a SessionManager class to handle authentication with JWTs."
+  ❌ "The codebase uses a SessionManager class with JWTs."
 
-  Both might be true; only the first is verifiable.
+  ## Worked example: "How does this app handle uploads?"
 
-  ## Worked example: "How does this app handle file uploads?"
-
-  **Orient.** `ls`, `cat README.md`, `cat package.json`. It's an Express.js app with `multer` (a Node upload library) as a dependency — strong lead.
-
-  **Locate.** `rg -l "multer"` → `src/middleware/upload.js`, `src/routes/files.js`, `tests/upload.test.js`. `rg -l "upload"` adds `src/services/storage.js`.
-
-  **Read.** `cat src/middleware/upload.js` (~40 lines per `wc -l`, fine to read whole). For `src/routes/files.js` (320 lines), use `rg -n "upload" -A 20 src/routes/files.js` to see only upload routes.
-
-  **Verify.** `cat tests/upload.test.js` confirms behavior. `git --no-pager log --oneline -- src/middleware/upload.js` shows it was touched two weeks ago — current.
-
-  **Report.** "Uploads are handled by multer middleware in `src/middleware/upload.js`, limited to 10MB images (line 12). Routes in `src/routes/files.js:45-80` invoke this middleware and pass files to `StorageService.persist()` in `src/services/storage.js`, which writes to S3. Tests in `tests/upload.test.js` cover size limits, MIME validation, and S3 failures."
+  - **Orient:** `cat package.json` → Express + `multer`. Strong lead.
+  - **Locate:** `rg -l "multer"` → middleware, route, test. `rg -l "upload"` adds `src/services/storage.js`.
+  - **Read:** `wc -l` each; `cat` small ones; `rg -n "upload" -A 20 src/routes/files.js` for the big one.
+  - **Verify:** `cat tests/upload.test.js`; `git --no-pager log` shows recent activity.
+  - **Report:** "Multer in `src/middleware/upload.js:12` limits to 10MB images. Routes `src/routes/files.js:45-80` call `StorageService.persist()` in `src/services/storage.js` (→ S3). Tests cover size, MIME, S3 failures."
 
   ## Anti-patterns
 
-  - **Searching before orienting.** Always check the manifest and directory structure first.
-  - **Reading whole files when you need a function.** `wc -l` first, then `rg -n` with `-A`/`-B`.
-  - **Trusting comments over code.** Comments lie, docstrings stale. Prefer code, tests, and recent commits.
-  - **One search, one conclusion.** Cross-reference with call sites, tests, and git history.
-  - **Reporting without paths.** If you can't cite it, you don't know it.
-  - **Forgetting `.gitignore`.** Prefer `rg` and `git ls-files` over raw `find`/`grep -r` to avoid swamping in build artifacts.
+  - Searching before orienting.
+  - `cat` on large files — `wc -l` then `rg -n -A/-B`.
+  - Trusting comments over code, tests, recent commits.
+  - One search, one conclusion — cross-reference first.
+  - Reporting without paths — if you can't cite it, you don't know it.
+  - Raw `find`/`grep -r` on big repos — prefer `rg`, `git ls-files`.
 
   ## Quick reference
 
-  | Purpose | Primary | Notes |
-  |---|---|---|
-  | List files | `git ls-files`, `ls -la` | `find . -maxdepth N -type f` for broader |
-  | Directory shape | `find . -maxdepth 2 -type d \| sort` | No `tree` available |
-  | Search content | `rg` | Fall back to `grep -rn` |
-  | Read whole file | `cat` (small only) | `wc -l` first to check size |
-  | Read a range | `head -B file \| tail -(B-A+1)` | No `sed` available |
-  | File size/info | `wc -l`, `stat`, `file` | — |
-  | History | `git log`, `git log -S`, `git blame` | — |
-  | Diff a change | `git show <sha>`, `git diff`, `diff` | — |
-  | Find tests | `find . -path '*test*'` | — |
-  | Summarize matches | `rg -l ... \| cut \| sort \| uniq -c` | Useful for hotspot analysis |
+  | Purpose | Command |
+  |---|---|
+  | List project files | `git ls-files`, `ls -la` |
+  | Directory shape | `find . -maxdepth 2 -type d \| sort` |
+  | Search | `rg` (fallback `grep -rn`) |
+  | Line range | `head -B file \| tail -(B-A+1)` |
+  | Size/info | `wc -l`, `stat`, `file` |
+  | History | `git log`, `git log -S`, `git blame` |
+  | Diff | `git show`, `git diff`, `diff` |
+  | Find tests | `find . -path '*test*'` |
+  | Hotspots | `rg -l ... \| cut \| sort \| uniq -c` |
 
-  Most codebase questions resolve in 5-15 commands when the loop is followed. Agents flailing through 50+ commands are usually skipping step 1 or step 4.
+  Most questions resolve in 5-15 commands. 50+ means skipping step 1 or 4.
 
 env:
-  # Pager scrubbing — prevents pager escapes (less `!` shell-out) and
-  # prevents pagers from blocking the agent loop.
   - "GIT_PAGER=cat"
   - "PAGER=cat"
-  # No interactive credential prompts.
   - "GIT_TERMINAL_PROMPT=0"
-  # Neutralize user/system git config, which would otherwise let a
-  # compromised ~/.gitconfig inject aliases (git log -> !rm -rf /)
-  # or configure textconv/external diff drivers.
   - "GIT_CONFIG_GLOBAL=/dev/null"
   - "GIT_CONFIG_SYSTEM=/dev/null"
-  # Disable pathspec magic globally (:(attr:...), :(exclude), etc.).
-  # Defense in depth against hostile .gitattributes.
   - "GIT_LITERAL_PATHSPECS=1"
-  # Don't contend on index.lock for read operations.
   - "GIT_OPTIONAL_LOCKS=0"
-  # Predictable locale for text processing.
   - "LANG=C.UTF-8"
   - "LC_ALL=C.UTF-8"
 
@@ -164,13 +129,6 @@ commands:
   # ==================================================================
   # find
   # ==================================================================
-  # Blacklist mode: find is fundamentally safe except for actions that
-  # execute commands or write to files. Everything else — -name, -type,
-  # -path, -maxdepth, -print, -size, boolean operators — is permitted.
-  #
-  # NOTE: find's first positional args are starting paths. Path safety
-  # for those positionals is not enforced here; if needed, the parser
-  # must apply it out-of-band.
   - command: find
     mode: blacklist
     disallowed_args:
@@ -181,7 +139,7 @@ commands:
       - arg: "-okdir"
       # Deletion
       - arg: "-delete"
-      # File writes (the -fprint family writes matches to a named file)
+      # File writes
       - arg: "-fprint"
       - arg: "-fprint0"
       - arg: "-fprintf"
@@ -190,19 +148,15 @@ commands:
   # ==================================================================
   # git
   # ==================================================================
-  # WHITELIST MODE on the parent: only these top-level flags are
-  # permitted. Git's dangerous top-level flags are rejected by
-  # omission:
-  #   -c, -C, --exec-path, --git-dir, --work-tree, --namespace,
-  #   --config-env, --paginate/-p
-  # Each of these is an RCE or sandbox-escape vector. DO NOT add any
-  # to allowed_args without understanding the implications. The Env
-  # scrubbing above provides defense in depth but this whitelist is
-  # the primary gate.
+  # WHITELIST MODE on parent: git's dangerous top-level flags are
+  # rejected by omission (-c, -C, --git-dir, --work-tree, --exec-path,
+  # --namespace, --config-env, --paginate). Each is an RCE vector.
+  # DO NOT add without understanding the implications.
   #
-  # --no-pager is required on every invocation (enforced both here and
-  # on every subcommand, since required_args is a simple argv-contains
-  # check with no inheritance).
+  # Parent's allowed_args / required_args govern ONLY the top-level
+  # `git <flags> <subcommand>` portion — they do not apply to
+  # subcommands. DRY inheritance for subcommands lives in
+  # subcommands_cfg.
   - command: git
     mode: whitelist
     allowed_args:
@@ -211,126 +165,101 @@ commands:
       - arg: "--version"
     required_args:
       - arg: "--no-pager"
-    subcommands:
+    subcommands_cfg:
+      # Inherited by every subcommand: --no-pager required, and the
+      # three universally-dangerous flag families denied.
+      required_sub_args:
+        - arg: "--no-pager"
+      disallowed_sub_args:
+        # External diff / textconv — can invoke programs configured
+        # in repo-level .git/config or .gitattributes. Env scrubbing
+        # neutralizes config-based forms; these deny the explicit
+        # flag form.
+        - arg: "--ext-diff"
+        - arg: "--textconv"
+        # Output redirection — no read-only subcommand has a
+        # legitimate reason to write output to a file.
+        - regex: "^--output(=.*)?$"
+        # prevent command injection 
+        - arg: "--" 
+      commands:
 
-      # --------------------------------------------------------------
-      # git log
-      # --------------------------------------------------------------
-      - command: log
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          # Output redirection (writes to filesystem)
-          - regex: "^--output(=.*)?$"
-          # External diff drivers / textconv — these can invoke
-          # programs configured in repo-level .git/config or
-          # .gitattributes. The Env block neutralizes user/system
-          # config; these deny the flag form that would force them on.
-          - arg: "--ext-diff"
-          - arg: "--textconv"
+        # ----------------------------------------------------------
+        # git log
+        # ----------------------------------------------------------
+        # Inherited covers all relevant flag denials.
+        - command: log
+          mode: blacklist
+          disallowed_args: []
 
-      # --------------------------------------------------------------
-      # git show
-      # --------------------------------------------------------------
-      - command: show
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - regex: "^--output(=.*)?$"
-          - arg: "--ext-diff"
-          - arg: "--textconv"
+        # ----------------------------------------------------------
+        # git show
+        # ----------------------------------------------------------
+        - command: show
+          mode: blacklist
+          disallowed_args: []
 
-      # --------------------------------------------------------------
-      # git diff
-      # --------------------------------------------------------------
-      - command: diff
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - regex: "^--output(=.*)?$"
-          - arg: "--ext-diff"
-          - arg: "--textconv"
+        # ----------------------------------------------------------
+        # git diff
+        # ----------------------------------------------------------
+        - command: diff
+          mode: blacklist
+          disallowed_args: []
 
-      # --------------------------------------------------------------
-      # git status
-      # --------------------------------------------------------------
-      # status has no known dangerous flags. Blacklist empty; any
-      # known-safe flag is permitted.
-      - command: status
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args: []
+        # ----------------------------------------------------------
+        # git status
+        # ----------------------------------------------------------
+        # No known dangerous flags beyond what's inherited.
+        - command: status
+          mode: blacklist
+          disallowed_args: []
 
-      # --------------------------------------------------------------
-      # git blame
-      # --------------------------------------------------------------
-      # --contents=<file> reads an arbitrary file from disk and treats
-      # it as the blamed file's contents. Path-safety bypass; deny.
-      - command: blame
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - regex: "^--output(=.*)?$"
-          - regex: "^--contents(=.*)?$"
-          - arg: "--textconv"
+        # ----------------------------------------------------------
+        # git blame
+        # ----------------------------------------------------------
+        # --contents=<file> reads an arbitrary file as the blamed
+        # content. Path-policy bypass; unique to blame.
+        - command: blame
+          mode: blacklist
+          disallowed_args:
+            - regex: "^--contents(=.*)?$"
 
-      # --------------------------------------------------------------
-      # git ls-files
-      # --------------------------------------------------------------
-      # -X / --exclude-from=<file> reads exclude patterns from an
-      # arbitrary file. Not a direct RCE vector but lets the agent
-      # feed ls-files any path on disk; deny for consistency with
-      # the "agent doesn't reach outside the repo root" principle.
-      - command: ls-files
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - regex: "^--exclude-from(=.*)?$"
-          - arg: "-X"
+        # ----------------------------------------------------------
+        # git ls-files
+        # ----------------------------------------------------------
+        # -X / --exclude-from reads exclude patterns from an
+        # arbitrary file. Unique to ls-files.
+        - command: ls-files
+          mode: blacklist
+          disallowed_args:
+            - regex: "^--exclude-from(=.*)?$"
+            - arg: "-X"
 
-      # --------------------------------------------------------------
-      # git rev-parse
-      # --------------------------------------------------------------
-      # rev-parse is fundamentally informational (resolves refs to
-      # SHAs, reports repo metadata). The one flag worth denying is
-      # --parseopt, which changes rev-parse into a general-purpose
-      # option parser and is hard to reason about in a constrained
-      # context. --sq-quote is safe but niche.
-      - command: rev-parse
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - arg: "--parseopt"
+        # ----------------------------------------------------------
+        # git rev-parse
+        # ----------------------------------------------------------
+        # --parseopt repurposes rev-parse as a general option parser;
+        # hard to reason about, deny.
+        - command: rev-parse
+          mode: blacklist
+          disallowed_args:
+            - arg: "--parseopt"
 
-      # --------------------------------------------------------------
-      # git grep
-      # --------------------------------------------------------------
-      # -O / --open-files-in-pager=<cmd> runs <cmd> on every matching
-      # file — arbitrary command execution. Deny every form.
-      # --textconv is denied as elsewhere.
-      - command: grep
-        mode: blacklist
-        required_args:
-          - arg: "--no-pager"
-        disallowed_args:
-          - regex: "^-O.*$"
-          - regex: "^--open-files-in-pager(=.*)?$"
-          - arg: "--textconv"
-          - arg: "--ext-grep"
-  
-  # [... find and git entries above, unchanged ...]
+        # ----------------------------------------------------------
+        # git grep
+        # ----------------------------------------------------------
+        # -O / --open-files-in-pager runs a command on every match —
+        # direct RCE. --ext-grep is the external-grep analog.
+        - command: grep
+          mode: blacklist
+          disallowed_args:
+            - regex: "^-O.*$"
+            - regex: "^--open-files-in-pager(=.*)?$"
+            - arg: "--ext-grep"
 
   # ==================================================================
   # ls
   # ==================================================================
-  # ls is safe; no flags execute code or write files. Blacklist empty.
   - command: ls
     mode: blacklist
     disallowed_args: []
@@ -338,8 +267,6 @@ commands:
   # ==================================================================
   # cat
   # ==================================================================
-  # cat reads files to stdout. Every flag is cosmetic (-A, -n, -b, -E,
-  # -T, -v, -s). Path safety is the real concern, handled out-of-band.
   - command: cat
     mode: blacklist
     disallowed_args: []
@@ -347,7 +274,6 @@ commands:
   # ==================================================================
   # head
   # ==================================================================
-  # head has no dangerous flags. Empty blacklist.
   - command: head
     mode: blacklist
     disallowed_args: []
@@ -355,9 +281,7 @@ commands:
   # ==================================================================
   # tail
   # ==================================================================
-  # -f / --follow blocks the agent loop waiting for new data. -F is
-  # shorthand for --follow=name --retry, same problem. --retry alone
-  # also implies follow behavior. Deny all forms.
+  # -f / -F / --follow / --retry block the agent loop.
   - command: tail
     mode: blacklist
     disallowed_args:
@@ -370,9 +294,7 @@ commands:
   # ==================================================================
   # wc
   # ==================================================================
-  # wc is safe. --files0-from reads a filename list from an arbitrary
-  # file; not an RCE but bypasses path policy if the caller enforces
-  # it on positional args only. Deny for consistency.
+  # --files0-from reads a filename list from an arbitrary file.
   - command: wc
     mode: blacklist
     disallowed_args:
@@ -381,8 +303,7 @@ commands:
   # ==================================================================
   # file
   # ==================================================================
-  # file identifies file types. -C compiles magic files (write op on
-  # some systems) and -m uses a custom magic file. Deny both.
+  # -C compiles magic files; -m loads a custom magic file.
   - command: file
     mode: blacklist
     disallowed_args:
@@ -394,7 +315,6 @@ commands:
   # ==================================================================
   # stat
   # ==================================================================
-  # stat is purely informational. No dangerous flags.
   - command: stat
     mode: blacklist
     disallowed_args: []
@@ -402,9 +322,8 @@ commands:
   # ==================================================================
   # grep
   # ==================================================================
-  # grep is safe. -f/--file reads patterns from an arbitrary file;
-  # --include-from / --exclude-from likewise. Deny the file-reading
-  # forms for path-policy consistency. No RCE flags in GNU grep.
+  # -f/--file and --include-from / --exclude-from read from arbitrary
+  # files (path-policy bypass). No RCE flags in GNU grep.
   - command: grep
     mode: blacklist
     disallowed_args:
@@ -416,11 +335,9 @@ commands:
   # ==================================================================
   # rg (ripgrep)
   # ==================================================================
-  # --pre=<cmd> runs <cmd> as a preprocessor on every matched file:
-  # arbitrary command execution. --hostname-bin=<cmd> runs <cmd> to
-  # determine the hostname. Both are direct RCE vectors.
-  # -z / --search-zip invokes external decompressors; lower risk but
-  # deny. File-list flags read arbitrary paths; deny for consistency.
+  # --pre=<cmd> and --hostname-bin=<cmd> run external commands: RCE.
+  # -z / --search-zip invokes external decompressors; deny.
+  # -f / --file / --ignore-file read from arbitrary files.
   - command: rg
     mode: blacklist
     disallowed_args:
@@ -437,8 +354,7 @@ commands:
   # ==================================================================
   # diff
   # ==================================================================
-  # diff itself is safe. --to-file / --from-file take alternate paths
-  # that could bypass path policy; deny. No RCE flags.
+  # --to-file / --from-file can bypass path policy via alternate paths.
   - command: diff
     mode: blacklist
     disallowed_args:
@@ -448,8 +364,8 @@ commands:
   # ==================================================================
   # sort
   # ==================================================================
-  # -o / --output writes to a file. --compress-program=<cmd> runs
-  # <cmd> on temp files — RCE. --files0-from reads a file list.
+  # -o / --output writes to file. --compress-program=<cmd> runs <cmd>
+  # on temp files — RCE. --files0-from reads a file list.
   - command: sort
     mode: blacklist
     disallowed_args:
@@ -462,7 +378,6 @@ commands:
   # ==================================================================
   # uniq
   # ==================================================================
-  # uniq is safe.
   - command: uniq
     mode: blacklist
     disallowed_args: []
@@ -470,7 +385,6 @@ commands:
   # ==================================================================
   # cut
   # ==================================================================
-  # cut is safe.
   - command: cut
     mode: blacklist
     disallowed_args: []
@@ -478,7 +392,6 @@ commands:
   # ==================================================================
   # tr
   # ==================================================================
-  # tr is safe — reads stdin, writes stdout, no file access.
   - command: tr
     mode: blacklist
     disallowed_args: []
@@ -486,10 +399,8 @@ commands:
   # ==================================================================
   # ps
   # ==================================================================
-  # ps is an information-leak concern (other users' command lines may
-  # contain secrets) but has no flags that execute code or write.
-  # Leakage is handled by process-namespace isolation in the sandbox,
-  # not here.
+  # Information-leak concerns (other users' argv) handled by
+  # sandbox PID namespace, not here.
   - command: ps
     mode: blacklist
     disallowed_args: []
@@ -497,7 +408,6 @@ commands:
   # ==================================================================
   # df
   # ==================================================================
-  # df is safe.
   - command: df
     mode: blacklist
     disallowed_args: []
@@ -505,7 +415,6 @@ commands:
   # ==================================================================
   # du
   # ==================================================================
-  # du is safe. --files0-from reads a file list; deny for consistency.
   - command: du
     mode: blacklist
     disallowed_args:
@@ -514,7 +423,6 @@ commands:
   # ==================================================================
   # uname
   # ==================================================================
-  # uname is purely informational.
   - command: uname
     mode: blacklist
     disallowed_args: []
@@ -522,7 +430,6 @@ commands:
   # ==================================================================
   # whoami
   # ==================================================================
-  # whoami takes no meaningful arguments.
   - command: whoami
     mode: blacklist
     disallowed_args: []
@@ -530,8 +437,7 @@ commands:
   # ==================================================================
   # date
   # ==================================================================
-  # -s / --set sets the system clock. Requires root in practice but
-  # deny regardless.
+  # -s / --set sets the system clock (requires root in practice).
   - command: date
     mode: blacklist
     disallowed_args:

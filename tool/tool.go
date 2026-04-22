@@ -37,7 +37,7 @@ type Command struct {
 	// Crucially, any permissions on the parent do NOT apply to the subcommands.
 	// Subcommands must define their own allows/denies.
 	// If a subcommand is defined, it will be allowed regardless of the parent's command mode.
-	Subcommands []Command `yaml:"subcommands"`
+	Subcommands *SubcommandsConfig `yaml:"subcommands_cfg,omitempty"`
 
 	// Mode is the permission that determines if the AllowedArgs or DisallowedArgs list
 	// is used. If Mode is "whitelist", only the arguments whitelisted in AllowedArgs are allowed.
@@ -52,6 +52,13 @@ type Command struct {
 
 	// RequiredArgs is a list of arguments that must be provided with the command. Supplied in order presented in YAML.
 	RequiredArgs []Argument `yaml:"required_args,omitempty"`
+}
+
+type SubcommandsConfig struct {
+	Commands          []Command  `yaml:"commands"`
+	RequiredSubArgs   []Argument `yaml:"required_sub_args,omitempty"`
+	AllowedSubArgs    []Argument `yaml:"allowed_sub_args,omitempty"`
+	DisallowedSubArgs []Argument `yaml:"disallowed_sub_args,omitempty"`
 }
 
 type Argument struct {
