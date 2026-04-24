@@ -1435,3 +1435,125 @@ func TestMatch_SourceProvenanceFormat(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------
+// Step 15: space-form hint for flag=value denials
+// ---------------------------------------------------------------------
+
+// TestMatch_EqualsHintFiresForAssignmentOnlyRegex verifies the hint is
+// attached when the denial is specific to the `=` form and the bare
+// flag would pass.
+func TestMatch_EqualsHintFiresForAssignmentOnlyRegex(t *testing.T) {
+	spec := &tool.ToolSpec{
+		Commands: []tool.Command{{
+			Command: "rg",
+			Mode:    tool.CommandModeBlacklist,
+			DisallowedArgs: []tool.Argument{
+				// = form denied; bare --file has no matching rule.
+				{Regex: "^--file=.*$"},
+			},
+		}},
+	}
+	m := mustMatcher(t, spec)
+
+	_, err := m.Match(seg("rg", "--file=patterns.txt"))
+	e := asError(t, err)
+	if e.Code != ErrArgDenied {
+		t.Fatalf("code = %s, want %s", e.Code, ErrArgDenied)
+	}
+	if e.Hint == "" {
+		t.Fatal("expected Hint to be populated for =-form-only denial")
+	}
+	for _, want := range []string{"--file", "patterns.txt", "space"} {
+		if !strings.Contains(e.Hint, want) {
+			t.Errorf("hint missing %q\nfull hint: %s", want, e.Hint)
+		}
+	}
+	// Error() must render the hint on a "hint:" line.
+	if !strings.Contains(e.Error(), "hint:") {
+		t.Errorf("Error() missing hint line:\n%s", e.Error())
+	}
+}
+
+// TestMatch_EqualsHintSuppressedWhenBareAlsoDenied verifies that the
+// hint is NOT attached when the bare flag would also be denied —
+// suggesting the space form would be misleading.
+func TestMatch_EqualsHintSuppressedWhenBareAlsoDenied(t *testing.T) {
+	// gitSpec denies `--textconv` via `arg: "--textconv"` which
+	// matches the bare form. A `--textconv=anything` token (not
+	// meaningfully valid in git, but permitted by the lexer) still
+	// matches nothing in the denylist because the rule is exact.
+	// Use diff-style `(=.*)?` pattern instead.
+	spec := &tool.ToolSpec{
+		Commands: []tool.Command{{
+			Command: "diff",
+			Mode:    tool.CommandModeBlacklist,
+			DisallowedArgs: []tool.Argument{
+				// Covers both bare and =value.
+				{Regex: "^--to-file(=.*)?$"},
+			},
+		}},
+	}
+	m := mustMatcher(t, spec)
+
+	_, err := m.Match(seg("diff", "--to-file=/etc/shadow"))
+	e := asError(t, err)
+	if e.Code != ErrArgDenied {
+		t.Fatalf("code = %s, want %s", e.Code, ErrArgDenied)
+	}
+	if e.Hint != "" {
+		t.Errorf("hint should be suppressed when bare form is also denied, got %q",
+			e.Hint)
+	}
+}
+
+// TestMatch_EqualsHintIgnoredForNonEqualsToken verifies that a token
+// without '=' never gets a hint, even on denial.
+func TestMatch_EqualsHintIgnoredForNonEqualsToken(t *testing.T) {
+	spec := &tool.ToolSpec{
+		Commands: []tool.Command{{
+			Command: "tail",
+			Mode:    tool.CommandModeBlacklist,
+			DisallowedArgs: []tool.Argument{
+				{Arg: "-f"},
+			},
+		}},
+	}
+	m := mustMatcher(t, spec)
+
+	_, err := m.Match(seg("tail", "-f", "/var/log/x"))
+	e := asError(t, err)
+	if e.Hint != "" {
+		t.Errorf("no-= token should never carry a hint, got %q", e.Hint)
+	}
+}
+
+// TestMatch_EqualsHintInWhitelist verifies the symmetric case: when
+// a leaf is whitelist-mode and only the bare flag is in AllowedArgs,
+// a `flag=value` token fails with a hint to space-separate.
+func TestMatch_EqualsHintInWhitelist(t *testing.T) {
+	spec := &tool.ToolSpec{
+		Commands: []tool.Command{{
+			Command: "cmd",
+			Mode:    tool.CommandModeWhitelist,
+			AllowedArgs: []tool.Argument{
+				{Arg: "--name"},
+			},
+		}},
+	}
+	m := mustMatcher(t, spec)
+
+	_, err := m.Match(seg("cmd", "--name=alice"))
+	e := asError(t, err)
+	if e.Code != ErrArgNotAllowed {
+		t.Fatalf("code = %s, want %s", e.Code, ErrArgNotAllowed)
+	}
+	if e.Hint == "" {
+		t.Fatal("expected Hint for =-form token when bare is in allow list")
+	}
+	for _, want := range []string{"--name", "alice", "space"} {
+		if !strings.Contains(e.Hint, want) {
+			t.Errorf("hint missing %q\nfull hint: %s", want, e.Hint)
+		}
+	}
+}

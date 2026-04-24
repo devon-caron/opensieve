@@ -107,6 +107,14 @@ type Error struct {
 	// to attach a policy-specific explanation (e.g., why a particular
 	// flag is dangerous).
 	Reason string
+
+	// Hint is an optional, situation-specific tip rendered as the
+	// "hint:" line. Unlike Reason, Hint does not replace the generic
+	// explanation — it sits alongside it. Populated by the validator
+	// for failure modes that have a commonly-applicable remediation
+	// shortcut (e.g., "= assignment isn't supported; try space-
+	// separated form").
+	Hint string
 }
 
 func (e *Error) Error() string {
@@ -149,6 +157,10 @@ func (e *Error) Error() string {
 	if len(e.Subs) > 0 {
 		b.WriteString("\n  subs:    ")
 		b.WriteString(strings.Join(e.Subs, ", "))
+	}
+	if e.Hint != "" {
+		b.WriteString("\n  hint:    ")
+		b.WriteString(e.Hint)
 	}
 	if fix := e.fix(); fix != "" {
 		b.WriteString("\n  fix:     ")

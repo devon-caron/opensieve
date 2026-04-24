@@ -78,13 +78,20 @@ func validateWhitelist(e *entry, cmdPath string, tok lex.Token) *Error {
 		}
 	}
 	if matched == nil {
-		return &Error{
+		out := &Error{
 			Code:    ErrArgNotAllowed,
 			Command: cmdPath,
 			Token:   tok.Value,
 			Pos:     tok.Pos,
 			Allowed: e.allowedPatterns(),
 		}
+		// Hint: if the token is shaped like flag=value and the bare
+		// flag IS in the allow list, tell the agent to space-separate.
+		out.Hint = spaceFormHint(tok.Value, func(bare string) bool {
+			m, err := anyMatches(bare, e.allowed)
+			return err == nil && m != nil // bare is allowed
+		})
+		return out
 	}
 	return nil
 }
@@ -101,7 +108,7 @@ func validateBlacklist(e *entry, cmdPath string, tok lex.Token) *Error {
 		}
 	}
 	if matched != nil {
-		return &Error{
+		out := &Error{
 			Code:    ErrArgDenied,
 			Command: cmdPath,
 			Token:   tok.Value,
@@ -109,8 +116,46 @@ func validateBlacklist(e *entry, cmdPath string, tok lex.Token) *Error {
 			Pattern: matched.humanPattern(),
 			Source:  matched.source,
 		}
+		// Hint: if the token is shaped like flag=value and the bare
+		// flag is NOT denied by any rule, the denial is specific to
+		// the = form. Tell the agent to space-separate.
+		out.Hint = spaceFormHint(tok.Value, func(bare string) bool {
+			m, err := anyMatches(bare, e.disallowed)
+			return err == nil && m == nil // bare is NOT denied
+		})
+		return out
 	}
 	return nil
+}
+
+// spaceFormHint returns a remediation tip when a failing flag=value
+// token would likely succeed in its space-separated form.
+//
+// The caller supplies bareFormOK, a predicate that reports whether
+// stripping the "=value" tail from the token would clear the current
+// failure mode:
+//
+//   - In blacklist mode, bareFormOK returns true when the bare flag
+//     matches no deny rule.
+//   - In whitelist mode, bareFormOK returns true when the bare flag
+//     IS in the allow list.
+//
+// When bareFormOK returns false, spaceFormHint returns "" — suggesting
+// the space form would be misleading because it would fail for the
+// same reason. When the token has no "=", the result is also "".
+func spaceFormHint(token string, bareFormOK func(bare string) bool) string {
+	eq := strings.IndexByte(token, '=')
+	if eq <= 0 {
+		return ""
+	}
+	bare := token[:eq]
+	if !bareFormOK(bare) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%q does not accept the key=value form here; "+
+			"pass the value separated by a space instead (e.g., %q %q).",
+		bare, bare, token[eq+1:])
 }
 
 // requiredSatisfied reports whether at least one token in argv
