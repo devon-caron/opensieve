@@ -7,69 +7,103 @@ import (
 	"github.com/devon-caron/opensieve/tool"
 )
 
-// Index is a precomputed lookup structure built from a tool.ToolSpec
-// at load time. All regex compilation and list merging happens here,
-// so the matcher's hot path does no allocation or compilation work.
+// Index is the precomputed lookup structure built from a tool.ToolSpec
+// at load time. All regex compilation, doublestar validation, and
+// inheritance flattening happens here so the matcher's hot path does
+// no allocation or compilation work.
 type Index struct {
 	// byName maps a top-level command name to its compiled entry.
-	// Example: "git" -> *entry for git.
 	byName map[string]*entry
+
+	// names is the registered command names in declaration order. Used
+	// to render the "allowed:" line of an ErrCommandNotAllowed.
+	names []string
 }
 
 // entry is the compiled form of a tool.Command, carrying precompiled
-// patterns and effective (merged) arg lists for subcommands.
+// patterns and the effective disallowed-args list (own ∪ every
+// ancestor's subcommands.disallowed_sub_args).
 type entry struct {
-	name string // the command name, e.g., "git" or "log"
+	name string
 	raw  *tool.Command
-
 	mode tool.CommandMode
 
-	// Compiled, merged arg lists. For subcommands, these include
-	// inherited entries from the parent's SubcommandsConfig.
+	// Compiled arg lists. allowed/required hold only this entry's own
+	// declarations; disallowed is the recursive union of own +
+	// every ancestor's subcommands.disallowed_sub_args, so a denial
+	// anywhere in the chain reaches every descendant. Each
+	// compiledArg.source records its provenance so error messages can
+	// cite the YAML location.
 	allowed    []*compiledArg
 	disallowed []*compiledArg
 	required   []*compiledArg
 
-	// subByName maps subcommand name -> subcommand entry. Nil for
+	// subByName maps subcommand name → subcommand entry. Nil for
 	// commands without subcommands.
 	subByName map[string]*entry
+
+	// subNames is the subcommand names in declaration order. Used to
+	// render the "subs:" line of routing-stage ErrArgNotAllowed.
+	subNames []string
 }
 
-// compiledArg is the precompiled form of a tool.Argument.
-//
-// Exactly one of the fields is populated based on which field of the
-// source Argument was set. The original is retained for error
-// reporting.
+// compiledArg is the precompiled form of a tool.Argument. Exactly one
+// of exact/regex/path is populated, mirroring the source Argument's
+// Arg/Regex/PathSpec field.
 type compiledArg struct {
 	raw tool.Argument
 
-	exact string         // set if raw.Arg is populated
-	regex *regexp.Regexp // set if raw.Regex is populated
-	path  string         // set if raw.PathSpec is populated
+	exact string
+	regex *regexp.Regexp
+	path  string
+
+	// source is the YAML provenance string, e.g.
+	//   "git.allowed_args[0]"
+	//   "git.subcommands.disallowed_sub_args[1] (inherited)"
+	//   "git.log.disallowed_args[0]"
+	// Populated by the build path, never by the matcher.
+	source string
 }
 
-// humanPattern returns a user-facing string describing what this
-// compiled arg matches, for use in error messages.
+// humanPattern returns a one-line description of what this rule
+// matches, suitable for embedding in an error message.
 func (a *compiledArg) humanPattern() string {
 	switch {
 	case a.exact != "":
-		return a.exact
+		return fmt.Sprintf("exact %q", a.exact)
 	case a.regex != nil:
-		return "regex:" + a.regex.String()
+		return fmt.Sprintf("regex %q", a.regex.String())
 	case a.path != "":
-		return "path:" + a.path
+		return fmt.Sprintf("path %q", a.path)
 	}
 	return "<empty>"
 }
 
+// allowedPatterns returns the human-readable patterns for an entry's
+// allowed list, used to populate Error.Allowed.
+func (e *entry) allowedPatterns() []string {
+	if len(e.allowed) == 0 {
+		return nil
+	}
+	out := make([]string, len(e.allowed))
+	for i, a := range e.allowed {
+		out[i] = a.humanPattern()
+	}
+	return out
+}
+
 // BuildIndex compiles a ToolSpec into an Index suitable for fast
-// matching. It fails if any regex in the policy does not compile or
-// if the policy is structurally invalid.
+// matching. It fails if any regex doesn't compile, any doublestar
+// pattern is malformed, or the policy is structurally invalid (empty
+// names, duplicates, arguments with multiple fields set).
 func BuildIndex(spec *tool.ToolSpec) (*Index, error) {
-	idx := &Index{byName: make(map[string]*entry, len(spec.Commands))}
+	idx := &Index{
+		byName: make(map[string]*entry, len(spec.Commands)),
+		names:  make([]string, 0, len(spec.Commands)),
+	}
 	for i := range spec.Commands {
 		cmd := &spec.Commands[i]
-		e, err := buildEntry(cmd, nil)
+		e, err := buildEntry(cmd, "", nil)
 		if err != nil {
 			return nil, fmt.Errorf("command %q: %w", cmd.Command, err)
 		}
@@ -77,14 +111,23 @@ func BuildIndex(spec *tool.ToolSpec) (*Index, error) {
 			return nil, fmt.Errorf("duplicate command %q", e.name)
 		}
 		idx.byName[e.name] = e
+		idx.names = append(idx.names, e.name)
 	}
 	return idx, nil
 }
 
 // buildEntry compiles a single command (and its subcommands, if any).
-// parentSubCfg is the parent's SubcommandsConfig if this entry is a
-// subcommand; nil for top-level commands.
-func buildEntry(cmd *tool.Command, parentSubCfg *tool.SubcommandsConfig) (*entry, error) {
+// pathPrefix is the dotted YAML path leading to this command (empty
+// for top-level entries). inheritedDeny is the accumulated list of
+// disallowed_sub_args compiled from every ancestor's
+// subcommands.disallowed_sub_args block; nil for top-level entries.
+//
+// Each level appends inheritedDeny to its own disallowed list, then
+// folds its own subcommands.disallowed_sub_args into the accumulator
+// before recursing. That makes a denial declared anywhere in the
+// chain visible at every descendant, which is what the policy reads
+// like in the YAML.
+func buildEntry(cmd *tool.Command, pathPrefix string, inheritedDeny []*compiledArg) (*entry, error) {
 	if cmd.Command == "" {
 		return nil, fmt.Errorf("command name is empty")
 	}
@@ -95,36 +138,44 @@ func buildEntry(cmd *tool.Command, parentSubCfg *tool.SubcommandsConfig) (*entry
 		mode: cmd.Mode,
 	}
 
-	own, err := compileArgLists(cmd)
+	// Own arg lists. Source prefix is "<full-path>.<list-name>".
+	ownPath := joinPath(pathPrefix, cmd.Command)
+	allowedOwn, err := compileArgs(cmd.AllowedArgs, ownPath+".allowed_args", false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("allowed_args: %w", err)
+	}
+	disallowedOwn, err := compileArgs(cmd.DisallowedArgs, ownPath+".disallowed_args", false)
+	if err != nil {
+		return nil, fmt.Errorf("disallowed_args: %w", err)
+	}
+	requiredOwn, err := compileArgs(cmd.RequiredArgs, ownPath+".required_args", false)
+	if err != nil {
+		return nil, fmt.Errorf("required_args: %w", err)
 	}
 
-	var inheritedAllowed, inheritedDisallowed, inheritedRequired []*compiledArg
-	if parentSubCfg != nil {
-		inheritedAllowed, err = compileArgs(parentSubCfg.AllowedSubArgs)
-		if err != nil {
-			return nil, fmt.Errorf("inherited allowed_sub_args: %w", err)
-		}
-		inheritedDisallowed, err = compileArgs(parentSubCfg.DisallowedSubArgs)
-		if err != nil {
-			return nil, fmt.Errorf("inherited disallowed_sub_args: %w", err)
-		}
-		inheritedRequired, err = compileArgs(parentSubCfg.RequiredSubArgs)
-		if err != nil {
-			return nil, fmt.Errorf("inherited required_sub_args: %w", err)
-		}
-	}
-
-	e.allowed = append(own.allowed, inheritedAllowed...)
-	e.disallowed = append(own.disallowed, inheritedDisallowed...)
-	e.required = append(own.required, inheritedRequired...)
+	e.allowed = allowedOwn
+	e.disallowed = append(disallowedOwn, inheritedDeny...)
+	e.required = requiredOwn
 
 	if cmd.Subcommands != nil && len(cmd.Subcommands.Commands) > 0 {
+		// Compile this entry's own subcommands.disallowed_sub_args;
+		// tag them as inherited because that's how every descendant
+		// will encounter them.
+		ownSubDeny, err := compileArgs(cmd.Subcommands.DisallowedSubArgs,
+			ownPath+".subcommands.disallowed_sub_args", true)
+		if err != nil {
+			return nil, fmt.Errorf("subcommands.disallowed_sub_args: %w", err)
+		}
+		// Children inherit everything we inherited PLUS our own.
+		childDeny := make([]*compiledArg, 0, len(inheritedDeny)+len(ownSubDeny))
+		childDeny = append(childDeny, inheritedDeny...)
+		childDeny = append(childDeny, ownSubDeny...)
+
 		e.subByName = make(map[string]*entry, len(cmd.Subcommands.Commands))
+		e.subNames = make([]string, 0, len(cmd.Subcommands.Commands))
 		for i := range cmd.Subcommands.Commands {
 			sub := &cmd.Subcommands.Commands[i]
-			se, err := buildEntry(sub, cmd.Subcommands)
+			se, err := buildEntry(sub, ownPath, childDeny)
 			if err != nil {
 				return nil, fmt.Errorf("subcommand %q: %w", sub.Command, err)
 			}
@@ -133,39 +184,27 @@ func buildEntry(cmd *tool.Command, parentSubCfg *tool.SubcommandsConfig) (*entry
 					se.name, e.name)
 			}
 			e.subByName[se.name] = se
+			e.subNames = append(e.subNames, se.name)
 		}
 	}
 
 	return e, nil
 }
 
-// compiledLists holds the three compiled arg lists for a single
-// command's own policy.
-type compiledLists struct {
-	allowed    []*compiledArg
-	disallowed []*compiledArg
-	required   []*compiledArg
+// joinPath assembles a dotted YAML path. Treats an empty prefix as
+// "no prefix" rather than producing a leading dot.
+func joinPath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "." + name
 }
 
-func compileArgLists(cmd *tool.Command) (*compiledLists, error) {
-	allowed, err := compileArgs(cmd.AllowedArgs)
-	if err != nil {
-		return nil, fmt.Errorf("allowed_args: %w", err)
-	}
-	disallowed, err := compileArgs(cmd.DisallowedArgs)
-	if err != nil {
-		return nil, fmt.Errorf("disallowed_args: %w", err)
-	}
-	required, err := compileArgs(cmd.RequiredArgs)
-	if err != nil {
-		return nil, fmt.Errorf("required_args: %w", err)
-	}
-	return &compiledLists{
-		allowed: allowed, disallowed: disallowed, required: required,
-	}, nil
-}
-
-func compileArgs(args []tool.Argument) ([]*compiledArg, error) {
+// compileArgs compiles a slice of tool.Argument into compiledArgs and
+// stamps each with a source string of the form "<prefix>[<index>]".
+// When inherited is true, " (inherited)" is appended so error messages
+// can distinguish parent-defined rules from the entry's own.
+func compileArgs(args []tool.Argument, sourcePrefix string, inherited bool) ([]*compiledArg, error) {
 	if len(args) == 0 {
 		return nil, nil
 	}
@@ -175,16 +214,18 @@ func compileArgs(args []tool.Argument) ([]*compiledArg, error) {
 		if err != nil {
 			return nil, fmt.Errorf("arg %d: %w", i, err)
 		}
+		c.source = fmt.Sprintf("%s[%d]", sourcePrefix, i)
+		if inherited {
+			c.source += " (inherited)"
+		}
 		out = append(out, c)
 	}
 	return out, nil
 }
 
-// compileArg validates and compiles a single tool.Argument.
-//
-// Exactly one of Arg, Regex, or PathSpec must be populated. An empty
-// Argument, or one with multiple fields set, is rejected at load
-// time.
+// compileArg validates and compiles a single tool.Argument. Exactly
+// one of Arg, Regex, or PathSpec must be populated; an empty Argument
+// or one with multiple fields set is rejected.
 func compileArg(a tool.Argument) (*compiledArg, error) {
 	set := 0
 	if a.Arg != "" {
@@ -218,8 +259,8 @@ func compileArg(a tool.Argument) (*compiledArg, error) {
 		c.regex = re
 	case a.PathSpec != "":
 		// PathSpec is matched via doublestar at lookup time; we
-		// validate the pattern by attempting a no-op match. A bad
-		// pattern fails here rather than at the first use.
+		// validate the pattern here by attempting a no-op match so a
+		// bad pattern fails at load rather than at first use.
 		if err := validatePathSpec(a.PathSpec); err != nil {
 			return nil, fmt.Errorf("invalid path_spec %q: %w",
 				a.PathSpec, err)

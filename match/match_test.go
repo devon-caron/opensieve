@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/devon-caron/opensieve/lex"
 	"github.com/devon-caron/opensieve/tool"
 )
 
@@ -32,8 +33,24 @@ func mustBuildFails(t *testing.T, spec *tool.ToolSpec, wantSubstr string) {
 	}
 }
 
+// seg builds a Segment from word values, synthesizing byte positions
+// as if the words were joined with a single space. Positions reflect
+// the offset of each word's first byte in the assembled string, which
+// matches what the lexer would produce for the same input.
 func seg(words ...string) Segment {
-	return Segment{Words: words}
+	tokens := make([]lex.Token, len(words))
+	var raw strings.Builder
+	pos := 0
+	for i, w := range words {
+		if i > 0 {
+			raw.WriteByte(' ')
+			pos++
+		}
+		tokens[i] = lex.Token{Kind: lex.TokWord, Value: w, Pos: pos}
+		raw.WriteString(w)
+		pos += len(w)
+	}
+	return Segment{Tokens: tokens, Raw: raw.String()}
 }
 
 // asError extracts a single *Error from err, whether it was returned
@@ -82,7 +99,6 @@ func countCodes(es Errors, code ErrorCode) int {
 // Shared spec fixtures
 // ---------------------------------------------------------------------
 
-// simpleBlacklist returns a single-command blacklist spec for targeted tests.
 func simpleBlacklist(cmd string, deny ...tool.Argument) *tool.ToolSpec {
 	return &tool.ToolSpec{
 		Commands: []tool.Command{{
@@ -93,7 +109,6 @@ func simpleBlacklist(cmd string, deny ...tool.Argument) *tool.ToolSpec {
 	}
 }
 
-// simpleWhitelist returns a single-command whitelist spec.
 func simpleWhitelist(cmd string, allow ...tool.Argument) *tool.ToolSpec {
 	return &tool.ToolSpec{
 		Commands: []tool.Command{{
@@ -104,39 +119,40 @@ func simpleWhitelist(cmd string, allow ...tool.Argument) *tool.ToolSpec {
 	}
 }
 
-// gitSpec returns a representative git spec for routing and
-// inheritance tests. Mirrors the shape of the production policy.
+// gitSpec mirrors the production-style git policy from read_tool.yaml.
+//
+// `--no-pager` is modeled as a subcommand of git (rather than a parent
+// flag) so that strict subcommand routing forces every git invocation
+// through the no-pager gate. `disallowed_sub_args` declared at git's
+// level recursively reaches every leaf via the matcher's inheritance.
 func gitSpec() *tool.ToolSpec {
 	return &tool.ToolSpec{
 		Commands: []tool.Command{
 			{
 				Command: "git",
 				Mode:    tool.CommandModeWhitelist,
-				AllowedArgs: []tool.Argument{
-					{Arg: "--no-pager"},
-					{Arg: "--no-optional-locks"},
-					{Arg: "--version"},
-				},
-				RequiredArgs: []tool.Argument{
-					{Arg: "--no-pager"},
-				},
 				Subcommands: &tool.SubcommandsConfig{
-					RequiredSubArgs: []tool.Argument{
-						{Arg: "--no-pager"},
-					},
 					DisallowedSubArgs: []tool.Argument{
 						{Arg: "--ext-diff"},
 						{Arg: "--textconv"},
 						{Regex: "^--output(=.*)?$"},
 					},
 					Commands: []tool.Command{
-						{Command: "log", Mode: tool.CommandModeBlacklist},
-						{Command: "status", Mode: tool.CommandModeBlacklist},
 						{
-							Command: "blame",
-							Mode:    tool.CommandModeBlacklist,
-							DisallowedArgs: []tool.Argument{
-								{Regex: "^--contents(=.*)?$"},
+							Command: "--no-pager",
+							Mode:    tool.CommandModeWhitelist,
+							Subcommands: &tool.SubcommandsConfig{
+								Commands: []tool.Command{
+									{Command: "log", Mode: tool.CommandModeBlacklist},
+									{Command: "status", Mode: tool.CommandModeBlacklist},
+									{
+										Command: "blame",
+										Mode:    tool.CommandModeBlacklist,
+										DisallowedArgs: []tool.Argument{
+											{Regex: "^--contents(=.*)?$"},
+										},
+									},
+								},
 							},
 						},
 					},
@@ -189,8 +205,6 @@ func TestMatch_UnknownCommand(t *testing.T) {
 }
 
 func TestMatch_CommandOnlyNoArgs(t *testing.T) {
-	// A command name with no args should match cleanly if the
-	// command has no RequiredArgs.
 	m := mustMatcher(t, simpleBlacklist("ls"))
 	r, err := m.Match(seg("ls"))
 	if err != nil {
@@ -261,7 +275,6 @@ func TestMatch_BlacklistRejectsListed(t *testing.T) {
 }
 
 func TestMatch_BlacklistEmptyDenyList(t *testing.T) {
-	// Blacklist with no entries allows everything.
 	m := mustMatcher(t, simpleBlacklist("cat"))
 	_, err := m.Match(seg("cat", "--anything", "--at", "all"))
 	if err != nil {
@@ -330,7 +343,6 @@ func TestMatch_WhitelistRejectsUnlisted(t *testing.T) {
 }
 
 func TestMatch_WhitelistEmptyAllowList(t *testing.T) {
-	// Whitelist with no entries rejects every non-command token.
 	spec := &tool.ToolSpec{
 		Commands: []tool.Command{{
 			Command: "git",
@@ -339,13 +351,11 @@ func TestMatch_WhitelistEmptyAllowList(t *testing.T) {
 	}
 	m := mustMatcher(t, spec)
 
-	// Command alone is fine.
 	_, err := m.Match(seg("git"))
 	if err != nil {
 		t.Errorf("bare git should match: %v", err)
 	}
 
-	// Any arg fails.
 	_, err = m.Match(seg("git", "--anything"))
 	e := asError(t, err)
 	if e.Code != ErrArgNotAllowed {
@@ -362,14 +372,12 @@ func TestMatch_ExactArgMatchesOnlyExactString(t *testing.T) {
 		tool.Argument{Arg: "--foo"},
 	))
 
-	// Exactly --foo is denied.
 	_, err := m.Match(seg("x", "--foo"))
 	e := asError(t, err)
 	if e.Code != ErrArgDenied {
 		t.Fatalf("expected denial of --foo, got %v", err)
 	}
 
-	// Substring and superstring are not denied.
 	passCases := []string{
 		"--foobar",
 		"--foo=bar",
@@ -389,7 +397,6 @@ func TestMatch_ExactArgMatchesOnlyExactString(t *testing.T) {
 }
 
 func TestMatch_ExactArgEmptyString(t *testing.T) {
-	// Can't configure: loader rejects empty arg. Verify.
 	spec := &tool.ToolSpec{
 		Commands: []tool.Command{{
 			Command: "x",
@@ -428,12 +435,12 @@ func TestMatch_RegexMatchesAnchoredPatterns(t *testing.T) {
 	}
 
 	passCases := []string{
-		"--outputs",       // not anchored at end
-		"--output-dir",    // has non-= suffix
-		"-output",         // wrong dash count
-		"output",          // no dashes
-		"--OUTPUT",        // case mismatch
-		"--output-file=x", // superset
+		"--outputs",
+		"--output-dir",
+		"-output",
+		"output",
+		"--OUTPUT",
+		"--output-file=x",
 	}
 	for _, c := range passCases {
 		t.Run("pass_"+c, func(t *testing.T) {
@@ -446,14 +453,10 @@ func TestMatch_RegexMatchesAnchoredPatterns(t *testing.T) {
 }
 
 func TestMatch_RegexUnanchoredWarning(t *testing.T) {
-	// An unanchored regex matches substrings. This is the user's
-	// problem (policy bug, not matcher bug), but we should verify
-	// behavior is predictable.
 	m := mustMatcher(t, simpleBlacklist("x",
 		tool.Argument{Regex: "output"},
 	))
 
-	// All of these contain "output" and are denied.
 	for _, c := range []string{"output", "--output", "foutputbar", "--output=x"} {
 		t.Run("deny_"+c, func(t *testing.T) {
 			_, err := m.Match(seg("x", c))
@@ -466,8 +469,6 @@ func TestMatch_RegexUnanchoredWarning(t *testing.T) {
 }
 
 func TestMatch_RegexShortOptionGlob(t *testing.T) {
-	// The rg "-O<cmd>" case from the production policy: deny -O
-	// and anything starting with -O.
 	m := mustMatcher(t, simpleBlacklist("rg",
 		tool.Argument{Regex: "^-O.*$"},
 	))
@@ -515,8 +516,8 @@ func TestMatch_PathSpecDenySingleStar(t *testing.T) {
 	}
 
 	passCases := []string{
-		"/etc/ssl/cert.pem", // deeper path, single * doesn't cross /
-		"/etc",              // not under /etc/
+		"/etc/ssl/cert.pem",
+		"/etc",
 		"/var/log/syslog",
 		"etc/passwd",
 	}
@@ -567,7 +568,7 @@ func TestMatch_PathSpecExtensionGlob(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
-// Step 7: subcommand routing
+// Step 7: subcommand routing (the previously-broken cases)
 // ---------------------------------------------------------------------
 
 func TestMatch_SubcommandRoutesToOwnEntry(t *testing.T) {
@@ -578,9 +579,9 @@ func TestMatch_SubcommandRoutesToOwnEntry(t *testing.T) {
 		argv []string
 		path []string
 	}{
-		{"git log", []string{"git", "--no-pager", "log", "--no-pager", "--oneline"}, []string{"git", "log"}},
-		{"git status", []string{"git", "--no-pager", "status", "--no-pager"}, []string{"git", "status"}},
-		{"git blame", []string{"git", "--no-pager", "blame", "--no-pager", "file.go"}, []string{"git", "blame"}},
+		{"git log", []string{"git", "--no-pager", "log", "--oneline"}, []string{"git", "--no-pager", "log"}},
+		{"git status", []string{"git", "--no-pager", "status"}, []string{"git", "--no-pager", "status"}},
+		{"git blame", []string{"git", "--no-pager", "blame", "file.go"}, []string{"git", "--no-pager", "blame"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -601,9 +602,10 @@ func TestMatch_SubcommandRoutesToOwnEntry(t *testing.T) {
 }
 
 func TestMatch_UnknownSubcommandFallsThrough(t *testing.T) {
-	// Per decision: unknown subcommand of a whitelist parent is
-	// validated as an arg against the parent's AllowedArgs,
-	// producing ErrArgNotAllowed.
+	// Per design: an unknown token at any routing level is reported as
+	// ErrArgNotAllowed at that token's position, with the level's known
+	// subs attached. Routing fails fast — anything past the unknown
+	// token is unreached.
 	m := mustMatcher(t, gitSpec())
 
 	cases := []struct {
@@ -611,9 +613,10 @@ func TestMatch_UnknownSubcommandFallsThrough(t *testing.T) {
 		argv  []string
 		token string
 	}{
-		{"git stash (unknown sub)", []string{"git", "--no-pager", "stash"}, "stash"},
-		{"git push (unknown sub)", []string{"git", "--no-pager", "push", "origin"}, "push"},
+		{"git stash (unknown leaf-2 sub)", []string{"git", "--no-pager", "stash"}, "stash"},
+		{"git push (unknown leaf-2 sub)", []string{"git", "--no-pager", "push", "origin"}, "push"},
 		{"git <typo>", []string{"git", "--no-pager", "lgo"}, "lgo"},
+		{"git foo (unknown level-1 sub)", []string{"git", "foo"}, "foo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -625,87 +628,63 @@ func TestMatch_UnknownSubcommandFallsThrough(t *testing.T) {
 			if e.Token != tc.token {
 				t.Errorf("token = %q, want %q", e.Token, tc.token)
 			}
+			if len(e.Subs) == 0 {
+				t.Errorf("expected Subs to be populated for routing-stage failure")
+			}
 		})
 	}
 }
 
 func TestMatch_SubcommandWithNoArgsAfter(t *testing.T) {
-	// `git --no-pager log` with nothing after should route to log
-	// and apply log's validation.
 	m := mustMatcher(t, gitSpec())
 
-	r, err := m.Match(seg("git", "--no-pager", "log", "--no-pager"))
+	r, err := m.Match(seg("git", "--no-pager", "log"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(r.Path) != 2 || r.Path[1] != "log" {
-		t.Errorf("path = %v, want [git log]", r.Path)
-	}
-}
-
-func TestMatch_SubcommandBeforeTopLevelFlag(t *testing.T) {
-	// If the first token after `git` is a subcommand name, routing
-	// consumes it — even if a valid top-level flag would follow.
-	// This is correct behavior; subcommand routing has priority.
-	m := mustMatcher(t, gitSpec())
-
-	r, err := m.Match(seg("git", "log", "--no-pager"))
-	// The required --no-pager on git parent is missing because
-	// "log" was consumed by routing, so the parent never saw
-	// --no-pager. Actually, let's think: the parent's required_args
-	// is checked on the parent path's args (none here since routing
-	// consumed "log" first... wait, the parent validates args that
-	// remain AFTER routing? No — the parent's validation runs when
-	// the governing entry is the parent. When governing is the
-	// subcommand, the subcommand's required_args are checked.
-	//
-	// With the current design, "git log --no-pager" routes to the
-	// log subcommand, subcommand's required (inherited) is
-	// --no-pager, which is present. Should pass.
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if r != nil && len(r.Path) != 2 {
-		t.Errorf("path = %v, want [git log]", r.Path)
+	if len(r.Path) != 3 || r.Path[2] != "log" {
+		t.Errorf("path = %v, want [git --no-pager log]", r.Path)
 	}
 }
 
 func TestMatch_CommandWithSubsButNoArg(t *testing.T) {
-	// `git` with no args at all. No subcommand to route to. The
-	// parent governs. RequiredArgs includes --no-pager, so this
-	// should fail with ErrMissingRequired.
+	// `git` alone: no args, no routing. Validation runs against the
+	// top entry with an empty args list — git has no own required
+	// args in the new model, so it passes. (The spec relies on
+	// routing, not required_args, to force --no-pager.)
 	m := mustMatcher(t, gitSpec())
 
 	_, err := m.Match(seg("git"))
-	e := asError(t, err)
-	if e.Code != ErrMissingRequired {
-		t.Errorf("code = %s, want %s", e.Code, ErrMissingRequired)
+	if err != nil {
+		t.Errorf("bare git should pass under strict routing model: %v", err)
 	}
 }
 
-// ---------------------------------------------------------------------
-// Step 8: SubcommandsConfig inheritance
-// ---------------------------------------------------------------------
-
-func TestMatch_SubcommandInheritsRequired(t *testing.T) {
+// TestMatch_StrictRoutingRequiresKnownSub verifies that a non-sub
+// token immediately after a parent that has subs is rejected at
+// routing time. In the current model, allow-listing extra parent
+// flags requires modeling them as subs — there is no per-level
+// allowed_args pass-through during routing.
+func TestMatch_StrictRoutingRequiresKnownSub(t *testing.T) {
 	m := mustMatcher(t, gitSpec())
 
-	// Missing --no-pager should fail because it's in RequiredSubArgs.
-	cases := [][]string{
-		{"git", "--no-pager", "log"},    // parent has --no-pager but subcommand doesn't
-		{"git", "--no-pager", "status"}, // same
-		{"git", "--no-pager", "blame", "file.go"},
+	// git has one sub: --no-pager. Anything else fails at position 4.
+	_, err := m.Match(seg("git", "log", "--oneline"))
+	e := asError(t, err)
+	if e.Code != ErrArgNotAllowed {
+		t.Fatalf("code = %s, want %s", e.Code, ErrArgNotAllowed)
 	}
-	for _, argv := range cases {
-		t.Run(strings.Join(argv, "_"), func(t *testing.T) {
-			_, err := m.Match(seg(argv...))
-			errs := asErrors(t, err)
-			if countCodes(errs, ErrMissingRequired) == 0 {
-				t.Errorf("expected ErrMissingRequired in %v", errs)
-			}
-		})
+	if e.Token != "log" {
+		t.Errorf("token = %q, want log", e.Token)
+	}
+	if e.Pos != 4 {
+		t.Errorf("pos = %d, want 4", e.Pos)
 	}
 }
+
+// ---------------------------------------------------------------------
+// Step 8: SubcommandsConfig inheritance (recursive disallow)
+// ---------------------------------------------------------------------
 
 func TestMatch_SubcommandInheritsDisallowed(t *testing.T) {
 	m := mustMatcher(t, gitSpec())
@@ -717,17 +696,17 @@ func TestMatch_SubcommandInheritsDisallowed(t *testing.T) {
 	}{
 		{
 			"log with --textconv",
-			[]string{"git", "--no-pager", "log", "--no-pager", "--textconv"},
+			[]string{"git", "--no-pager", "log", "--textconv"},
 			"--textconv",
 		},
 		{
 			"status with --ext-diff",
-			[]string{"git", "--no-pager", "status", "--no-pager", "--ext-diff"},
+			[]string{"git", "--no-pager", "status", "--ext-diff"},
 			"--ext-diff",
 		},
 		{
 			"log with --output=file",
-			[]string{"git", "--no-pager", "log", "--no-pager", "--output=/tmp/x"},
+			[]string{"git", "--no-pager", "log", "--output=/tmp/x"},
 			"--output=/tmp/x",
 		},
 	}
@@ -751,8 +730,6 @@ func TestMatch_SubcommandInheritsDisallowed(t *testing.T) {
 }
 
 func TestMatch_SubcommandOwnAndInheritedCombine(t *testing.T) {
-	// blame has its own DisallowedArgs (--contents) and also
-	// inherits --textconv, --ext-diff, --output from the parent.
 	m := mustMatcher(t, gitSpec())
 
 	cases := []struct {
@@ -766,7 +743,7 @@ func TestMatch_SubcommandOwnAndInheritedCombine(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := m.Match(seg("git", "--no-pager", "blame",
-				"--no-pager", "file.go", tc.token))
+				"file.go", tc.token))
 			errs := asErrors(t, err)
 			if countCodes(errs, ErrArgDenied) == 0 {
 				t.Errorf("expected ErrArgDenied for %q in %v",
@@ -776,80 +753,29 @@ func TestMatch_SubcommandOwnAndInheritedCombine(t *testing.T) {
 	}
 }
 
-func TestMatch_SubcommandInheritsWhitelistAllowed(t *testing.T) {
-	// Test that AllowedSubArgs inheritance also works in whitelist
-	// mode. The gitSpec uses blacklist subcommands, so use a
-	// custom spec for this case.
-	spec := &tool.ToolSpec{
-		Commands: []tool.Command{{
-			Command: "cmd",
-			Mode:    tool.CommandModeBlacklist,
-			Subcommands: &tool.SubcommandsConfig{
-				AllowedSubArgs: []tool.Argument{
-					{Arg: "--global-ok"},
-				},
-				Commands: []tool.Command{{
-					Command: "sub",
-					Mode:    tool.CommandModeWhitelist,
-					AllowedArgs: []tool.Argument{
-						{Arg: "--sub-only"},
-					},
-				}},
-			},
-		}},
-	}
-	m := mustMatcher(t, spec)
+// TestMatch_DisallowedInheritsRecursively verifies that a denial
+// declared on a grandparent reaches every descendant, not just direct
+// children. With gitSpec, `--textconv` is declared at git's level but
+// must surface on `log` (two levels down) via `--no-pager`.
+func TestMatch_DisallowedInheritsRecursively(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
 
-	// Inherited arg should pass whitelist.
-	_, err := m.Match(seg("cmd", "sub", "--global-ok"))
-	if err != nil {
-		t.Errorf("inherited allowed arg rejected: %v", err)
-	}
-	// Subcommand's own arg passes.
-	_, err = m.Match(seg("cmd", "sub", "--sub-only"))
-	if err != nil {
-		t.Errorf("own allowed arg rejected: %v", err)
-	}
-	// Neither list mentions --other.
-	_, err = m.Match(seg("cmd", "sub", "--other"))
-	e := asError(t, err)
-	if e.Code != ErrArgNotAllowed {
-		t.Errorf("code = %s, want %s", e.Code, ErrArgNotAllowed)
-	}
-}
-
-func TestMatch_NoInheritanceOnParentItself(t *testing.T) {
-	// SubcommandsConfig lists should NOT affect the parent's own
-	// validation — only its subcommands. Verify the parent's
-	// validation ignores them.
-	spec := &tool.ToolSpec{
-		Commands: []tool.Command{{
-			Command: "cmd",
-			Mode:    tool.CommandModeBlacklist,
-			Subcommands: &tool.SubcommandsConfig{
-				DisallowedSubArgs: []tool.Argument{
-					{Arg: "--only-sub-denies-this"},
-				},
-				Commands: []tool.Command{{
-					Command: "sub",
-					Mode:    tool.CommandModeBlacklist,
-				}},
-			},
-		}},
-	}
-	m := mustMatcher(t, spec)
-
-	// Arg is disallowed for subcommand.
-	_, err := m.Match(seg("cmd", "sub", "--only-sub-denies-this"))
+	_, err := m.Match(seg("git", "--no-pager", "log", "--textconv"))
 	e := asError(t, err)
 	if e.Code != ErrArgDenied {
-		t.Errorf("subcommand should deny: code = %s", e.Code)
+		t.Fatalf("code = %s, want %s", e.Code, ErrArgDenied)
 	}
-
-	// But parent `cmd` alone accepts it — no inheritance to parent.
-	_, err = m.Match(seg("cmd", "--only-sub-denies-this"))
-	if err != nil {
-		t.Errorf("parent should not inherit sub-denies: %v", err)
+	if e.Token != "--textconv" {
+		t.Errorf("token = %q, want --textconv", e.Token)
+	}
+	// Source must cite git's subcommands block (the grandparent), not
+	// --no-pager's (which declares no disallows of its own).
+	if !strings.Contains(e.Source, "git.subcommands.disallowed_sub_args") {
+		t.Errorf("source = %q, want it to cite git.subcommands.disallowed_sub_args",
+			e.Source)
+	}
+	if !strings.Contains(e.Source, "(inherited)") {
+		t.Errorf("source = %q, want (inherited) marker", e.Source)
 	}
 }
 
@@ -941,8 +867,8 @@ func TestMatch_RequiredArgRegexMatch(t *testing.T) {
 
 	failCases := [][]string{
 		{"cmd"},
-		{"cmd", "--config="}, // regex requires content after =
-		{"cmd", "--config"},  // regex requires =
+		{"cmd", "--config="},
+		{"cmd", "--config"},
 	}
 	for _, argv := range failCases {
 		t.Run("fail_"+strings.Join(argv, "_"), func(t *testing.T) {
@@ -969,20 +895,17 @@ func TestMatch_MultipleRequiredArgs(t *testing.T) {
 	}
 	m := mustMatcher(t, spec)
 
-	// All present.
 	_, err := m.Match(seg("cmd", "--one", "--two", "--three"))
 	if err != nil {
 		t.Errorf("all required present, got error: %v", err)
 	}
 
-	// Two missing — should get two errors.
 	_, err = m.Match(seg("cmd", "--one"))
 	errs := asErrors(t, err)
 	if countCodes(errs, ErrMissingRequired) != 2 {
 		t.Errorf("expected 2 missing, got %v", errs)
 	}
 
-	// None present — three errors.
 	_, err = m.Match(seg("cmd"))
 	errs = asErrors(t, err)
 	if countCodes(errs, ErrMissingRequired) != 3 {
@@ -1051,7 +974,6 @@ func TestMatch_CollectsWhitelistViolations(t *testing.T) {
 }
 
 func TestMatch_ErrorsContainsToken(t *testing.T) {
-	// Each collected error must identify its specific token.
 	m := mustMatcher(t, simpleBlacklist("find",
 		tool.Argument{Arg: "-exec"},
 		tool.Argument{Arg: "-delete"},
@@ -1093,8 +1015,8 @@ func TestMatch_ResultArgvUnchanged(t *testing.T) {
 func TestMatch_ResultEntryPointsToMatchedCommand(t *testing.T) {
 	m := mustMatcher(t, gitSpec())
 
-	// Top-level entry.
-	r, err := m.Match(seg("git", "--no-pager"))
+	// Bare `git` doesn't descend into any sub: entry stays at git.
+	r, err := m.Match(seg("git"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1102,8 +1024,8 @@ func TestMatch_ResultEntryPointsToMatchedCommand(t *testing.T) {
 		t.Errorf("entry = %q, want git", r.Entry.Command)
 	}
 
-	// Subcommand entry.
-	r, err = m.Match(seg("git", "--no-pager", "log", "--no-pager"))
+	// Routing descends through every matched sub: deepest entry wins.
+	r, err = m.Match(seg("git", "--no-pager", "log", "--oneline"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1224,7 +1146,6 @@ func TestBuildIndex_ArgumentAllFieldsEmpty(t *testing.T) {
 }
 
 func TestBuildIndex_ValidPolicyLoads(t *testing.T) {
-	// Sanity check: gitSpec must build successfully.
 	_, err := BuildIndex(gitSpec())
 	if err != nil {
 		t.Errorf("gitSpec should build, got %v", err)
@@ -1236,7 +1157,6 @@ func TestBuildIndex_ValidPolicyLoads(t *testing.T) {
 // ---------------------------------------------------------------------
 
 func TestMatch_UnknownModeIsFailClosed(t *testing.T) {
-	// A command with an unrecognized mode rejects all arguments.
 	spec := &tool.ToolSpec{
 		Commands: []tool.Command{{
 			Command: "x",
@@ -1245,13 +1165,11 @@ func TestMatch_UnknownModeIsFailClosed(t *testing.T) {
 	}
 	m := mustMatcher(t, spec)
 
-	// Command alone: no args to validate, so passes.
 	_, err := m.Match(seg("x"))
 	if err != nil {
 		t.Errorf("bare command with unknown mode should pass: %v", err)
 	}
 
-	// Any arg rejected.
 	_, err = m.Match(seg("x", "anything"))
 	e := asError(t, err)
 	if e.Code != ErrArgNotAllowed {
@@ -1260,8 +1178,6 @@ func TestMatch_UnknownModeIsFailClosed(t *testing.T) {
 }
 
 func TestMatch_SameTokenRepeatedInArgv(t *testing.T) {
-	// If the same disallowed token appears multiple times, we get
-	// multiple errors (one per occurrence).
 	m := mustMatcher(t, simpleBlacklist("x",
 		tool.Argument{Arg: "--bad"},
 	))
@@ -1274,15 +1190,13 @@ func TestMatch_SameTokenRepeatedInArgv(t *testing.T) {
 }
 
 func TestMatch_OverlappingPatternsFirstMatchWins(t *testing.T) {
-	// If two disallow patterns both match a token, the matcher
-	// reports the first one (load order). Verify.
 	spec := &tool.ToolSpec{
 		Commands: []tool.Command{{
 			Command: "x",
 			Mode:    tool.CommandModeBlacklist,
 			DisallowedArgs: []tool.Argument{
-				{Regex: "^--.*$"}, // first: anything starting with --
-				{Arg: "--output"}, // second: exact
+				{Regex: "^--.*$"},
+				{Arg: "--output"},
 			},
 		}},
 	}
@@ -1290,7 +1204,7 @@ func TestMatch_OverlappingPatternsFirstMatchWins(t *testing.T) {
 
 	_, err := m.Match(seg("x", "--output"))
 	e := asError(t, err)
-	if !strings.Contains(e.Pattern, "regex:") {
+	if !strings.HasPrefix(e.Pattern, "regex ") {
 		t.Errorf("expected first (regex) pattern to match, got pattern %q",
 			e.Pattern)
 	}
@@ -1299,15 +1213,14 @@ func TestMatch_OverlappingPatternsFirstMatchWins(t *testing.T) {
 func TestMatch_ErrorContainsCommandPath(t *testing.T) {
 	m := mustMatcher(t, gitSpec())
 
-	_, err := m.Match(seg("git", "--no-pager", "log", "--no-pager", "--textconv"))
+	_, err := m.Match(seg("git", "--no-pager", "log", "--textconv"))
 	e := asError(t, err)
-	if e.Command != "git log" {
-		t.Errorf("command path = %q, want git log", e.Command)
+	if e.Command != "git --no-pager log" {
+		t.Errorf("command path = %q, want git --no-pager log", e.Command)
 	}
 }
 
 func TestMatch_ErrorsInterfaceUnwrap(t *testing.T) {
-	// errors.Is on Errors should find matching error codes.
 	m := mustMatcher(t, simpleBlacklist("x",
 		tool.Argument{Arg: "-bad"},
 	))
@@ -1322,17 +1235,12 @@ func TestMatch_ErrorsInterfaceUnwrap(t *testing.T) {
 }
 
 func TestMatch_EmptyTokenInArgv(t *testing.T) {
-	// Empty-string tokens in argv. Lexer produces these for "".
-	// In blacklist mode, empty string matches nothing in deny list
-	// (assuming none of them are ""), so it passes.
 	m := mustMatcher(t, simpleBlacklist("x"))
 	_, err := m.Match(seg("x", "", "something"))
 	if err != nil {
 		t.Errorf("empty token in blacklist should pass: %v", err)
 	}
 
-	// In whitelist mode, empty string doesn't match typical allow
-	// entries, so it's rejected.
 	m = mustMatcher(t, simpleWhitelist("x",
 		tool.Argument{Arg: "--foo"},
 	))
@@ -1344,5 +1252,186 @@ func TestMatch_EmptyTokenInArgv(t *testing.T) {
 	}
 	if e.Token != "" {
 		t.Errorf("token should be empty string, got %q", e.Token)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Step 14: descriptive-error coverage (new)
+// ---------------------------------------------------------------------
+
+// TestMatch_PositionTracking verifies that errors carry the byte
+// offset of the offending token in the original input. The seg
+// helper synthesizes positions as if words were single-space
+// separated, matching what the lexer would produce.
+func TestMatch_PositionTracking(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	// "git --no-pager push origin"
+	//  0    4          15   20
+	_, err := m.Match(seg("git", "--no-pager", "push", "origin"))
+	e := asError(t, err)
+	if e.Token != "push" {
+		t.Fatalf("token = %q, want push", e.Token)
+	}
+	if e.Pos != 15 {
+		t.Errorf("pos = %d, want 15", e.Pos)
+	}
+}
+
+func TestMatch_PositionTrackingDenial(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	// "git --no-pager log --textconv"
+	//                     19
+	_, err := m.Match(seg("git", "--no-pager", "log", "--textconv"))
+	e := asError(t, err)
+	if e.Token != "--textconv" {
+		t.Fatalf("token = %q, want --textconv", e.Token)
+	}
+	if e.Pos != 19 {
+		t.Errorf("pos = %d, want 19", e.Pos)
+	}
+}
+
+// TestMatch_ErrorRendersDescriptive verifies Error.Error() output
+// includes the headline, token + position, source provenance, the
+// allowed/subs lists where relevant, and a fix line.
+func TestMatch_ErrorRendersDescriptiveDenial(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	_, err := m.Match(seg("git", "--no-pager", "log", "--textconv"))
+	e := asError(t, err)
+	out := e.Error()
+
+	wants := []string{
+		`arg_denied`,
+		`for command "git --no-pager log"`,
+		`token:`,
+		`"--textconv"`,
+		`at byte 19`,
+		`rule:`,
+		`subcommands.disallowed_sub_args`,
+		`(inherited)`,
+		`fix:`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Error() missing %q\nfull output:\n%s", w, out)
+		}
+	}
+}
+
+func TestMatch_ErrorRendersDescriptiveUnknownSub(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	// Unknown sub at the leaf-2 position (past `--no-pager`). The
+	// reported Subs should list `--no-pager`'s children (log, status,
+	// blame), not git's direct subs (just `--no-pager`).
+	_, err := m.Match(seg("git", "--no-pager", "push", "origin"))
+	e := asError(t, err)
+	out := e.Error()
+
+	wants := []string{
+		`arg_not_allowed`,
+		`for command "git --no-pager"`,
+		`"push"`,
+		`at byte 15`,
+		`subs:`,
+		`log`,
+		`status`,
+		`blame`,
+		`fix:`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Error() missing %q\nfull output:\n%s", w, out)
+		}
+	}
+}
+
+func TestMatch_ErrorRendersDescriptiveUnknownCommand(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	_, err := m.Match(seg("rm", "-rf", "/"))
+	e := asError(t, err)
+	out := e.Error()
+
+	wants := []string{
+		`command_not_allowed`,
+		`"rm"`,
+		`at byte 0`,
+		`allowed:`,
+		`git`,
+		`fix:`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Error() missing %q\nfull output:\n%s", w, out)
+		}
+	}
+}
+
+// TestMatch_ErrorsAggregation verifies the multi-error renderer
+// numbers and indents each child.
+func TestMatch_ErrorsAggregation(t *testing.T) {
+	m := mustMatcher(t, simpleBlacklist("find",
+		tool.Argument{Arg: "-exec"},
+		tool.Argument{Arg: "-delete"},
+	))
+
+	_, err := m.Match(seg("find", "-exec", "-delete"))
+	out := err.Error()
+
+	wants := []string{
+		`match: 2 errors:`,
+		`1.`,
+		`2.`,
+		`-exec`,
+		`-delete`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Errors.Error() missing %q\nfull output:\n%s", w, out)
+		}
+	}
+}
+
+// TestMatch_SourceProvenanceFormat sanity-checks the YAML-path-style
+// source strings produced by BuildIndex.
+func TestMatch_SourceProvenanceFormat(t *testing.T) {
+	m := mustMatcher(t, gitSpec())
+
+	cases := []struct {
+		name       string
+		argv       []string
+		wantSource string
+	}{
+		{
+			"inherited disallowed (from grandparent git)",
+			[]string{"git", "--no-pager", "log", "--textconv"},
+			"git.subcommands.disallowed_sub_args[1] (inherited)",
+		},
+		{
+			"own disallowed on subcommand",
+			[]string{"git", "--no-pager", "blame", "file.go", "--contents=/tmp/x"},
+			"git.--no-pager.blame.disallowed_args[0]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := m.Match(seg(tc.argv...))
+			errs := asErrors(t, err)
+			found := false
+			for _, e := range errs {
+				if e.Source == tc.wantSource {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected an error with Source = %q in %v",
+					tc.wantSource, errs)
+			}
+		})
 	}
 }

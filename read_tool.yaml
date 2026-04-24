@@ -156,20 +156,13 @@ commands:
   # Parent's allowed_args / required_args govern ONLY the top-level
   # `git <flags> <subcommand>` portion — they do not apply to
   # subcommands. DRY inheritance for subcommands lives in
-  # subcommands_cfg.
+  # subcommands.
   - command: git
+    # allow no root git commands without --no-pager to prevent agent stalls.
     mode: whitelist
     allowed_args:
-      - arg: "--no-pager"
-      - arg: "--no-optional-locks"
       - arg: "--version"
-    required_args:
-      - arg: "--no-pager"
-    subcommands_cfg:
-      # Inherited by every subcommand: --no-pager required, and the
-      # three universally-dangerous flag families denied.
-      required_sub_args:
-        - arg: "--no-pager"
+    subcommands:
       disallowed_sub_args:
         # External diff / textconv — can invoke programs configured
         # in repo-level .git/config or .gitattributes. Env scrubbing
@@ -183,79 +176,85 @@ commands:
         # prevent command injection 
         - arg: "--" 
       commands:
+        - command: "--no-pager"
+          mode: whitelist
+          allowed_args:
+            - arg: "--version"
+          subcommands:
+            commands:
 
-        # ----------------------------------------------------------
-        # git log
-        # ----------------------------------------------------------
-        # Inherited covers all relevant flag denials.
-        - command: log
-          mode: blacklist
-          disallowed_args: []
+              # ----------------------------------------------------------
+              # git log
+              # ----------------------------------------------------------
+              # Inherited covers all relevant flag denials.
+              - command: log
+                mode: blacklist
+                disallowed_args: []
 
-        # ----------------------------------------------------------
-        # git show
-        # ----------------------------------------------------------
-        - command: show
-          mode: blacklist
-          disallowed_args: []
+              # ----------------------------------------------------------
+              # git show
+              # ----------------------------------------------------------
+              - command: show
+                mode: blacklist
+                disallowed_args: []
 
-        # ----------------------------------------------------------
-        # git diff
-        # ----------------------------------------------------------
-        - command: diff
-          mode: blacklist
-          disallowed_args: []
+              # ----------------------------------------------------------
+              # git diff
+              # ----------------------------------------------------------
+              - command: diff
+                mode: blacklist
+                disallowed_args: []
 
-        # ----------------------------------------------------------
-        # git status
-        # ----------------------------------------------------------
-        # No known dangerous flags beyond what's inherited.
-        - command: status
-          mode: blacklist
-          disallowed_args: []
+              # ----------------------------------------------------------
+              # git status
+              # ----------------------------------------------------------
+              # No known dangerous flags beyond what's inherited.
+              - command: status
+                mode: blacklist
+                disallowed_args: []
 
-        # ----------------------------------------------------------
-        # git blame
-        # ----------------------------------------------------------
-        # --contents=<file> reads an arbitrary file as the blamed
-        # content. Path-policy bypass; unique to blame.
-        - command: blame
-          mode: blacklist
-          disallowed_args:
-            - regex: "^--contents(=.*)?$"
+              # ----------------------------------------------------------
+              # git blame
+              # ----------------------------------------------------------
+              # --contents=<file> reads an arbitrary file as the blamed
+              # content. Path-policy bypass; unique to blame.
+              - command: blame
+                mode: blacklist
+                disallowed_args:
+                  - regex: "^--contents(=.*)?$"
 
-        # ----------------------------------------------------------
-        # git ls-files
-        # ----------------------------------------------------------
-        # -X / --exclude-from reads exclude patterns from an
-        # arbitrary file. Unique to ls-files.
-        - command: ls-files
-          mode: blacklist
-          disallowed_args:
-            - regex: "^--exclude-from(=.*)?$"
-            - arg: "-X"
+              # ----------------------------------------------------------
+              # git ls-files
+              # ----------------------------------------------------------
+              # -X / --exclude-from reads exclude patterns from an
+              # arbitrary file. Unique to ls-files.
+              - command: ls-files
+                mode: blacklist
+                disallowed_args:
+                  - regex: "^--exclude-from(=.*)?$"
+                  - arg: "-X"
 
-        # ----------------------------------------------------------
-        # git rev-parse
-        # ----------------------------------------------------------
-        # --parseopt repurposes rev-parse as a general option parser;
-        # hard to reason about, deny.
-        - command: rev-parse
-          mode: blacklist
-          disallowed_args:
-            - arg: "--parseopt"
+              # ----------------------------------------------------------
+              # git rev-parse
+              # ----------------------------------------------------------
+              # --parseopt repurposes rev-parse as a general option parser;
+              # hard to reason about, deny.
+              - command: rev-parse
+                mode: blacklist
+                disallowed_args:
+                  - arg: "--parseopt"
 
-        # ----------------------------------------------------------
-        # git grep
-        # ----------------------------------------------------------
-        # -O / --open-files-in-pager runs a command on every match —
-        # direct RCE. --ext-grep is the external-grep analog.
-        - command: grep
-          mode: blacklist
-          disallowed_args:
-            - regex: "^-O.*$"
-            - regex: "^--open-files-in-pager(=.*)?$"
-            - arg: "--ext-grep"
+              # ----------------------------------------------------------
+              # git grep
+              # ----------------------------------------------------------
+              # -O / --open-files-in-pager runs a command on every match —
+              # direct RCE. --ext-grep is the external-grep analog.
+              - command: grep
+                mode: blacklist
+                disallowed_args:
+                  - regex: "^-O.*$"
+                  - regex: "^--open-files-in-pager(=.*)?$"
+                  - arg: "--ext-grep"
 
   # ==================================================================
   # ls

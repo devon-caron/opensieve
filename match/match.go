@@ -1,33 +1,39 @@
 package match
 
 import (
+	"strings"
+
+	"github.com/devon-caron/opensieve/lex"
 	"github.com/devon-caron/opensieve/tool"
 )
 
-// Segment is a single command invocation's worth of tokens, ready for
-// matching. It corresponds to one pipeline stage.
+// Segment is a single command invocation's worth of tokens, ready
+// for matching. It corresponds to one pipeline stage.
+//
+// Tokens carries lex word tokens only (pipe/EOF tokens are split
+// out upstream by the orchestrator). Each token preserves its byte
+// offset in the original input so error messages can pinpoint the
+// exact failing position. Raw is the original input slice for this
+// segment, provided for downstream caret-rendering — the matcher
+// itself does not read it.
 type Segment struct {
-	// Words is the sequence of token values (e.g., argv).
-	Words []string
-
-	// Pos is the byte offset of the first token in the original
-	// input. Used for error reporting.
-	Pos int
+	Tokens []lex.Token
+	Raw    string
 }
 
 // Result is the successful outcome of a match. On failure the matcher
 // returns a non-nil error (either *Error or Errors) and a nil result.
 type Result struct {
 	// Entry is the policy entry that governed this segment. For a
-	// top-level command, this is the top-level entry. For a
-	// subcommand invocation, this is the subcommand entry.
+	// top-level command this is the top-level entry; for a
+	// subcommand invocation, the subcommand entry.
 	Entry *tool.Command
 
 	// Path is the dotted command path, e.g., ["git"] or ["git", "log"].
 	Path []string
 
-	// Argv is Segment.Words unchanged, provided on the result so the
-	// caller has everything needed to exec in one place.
+	// Argv is the segment's token values, in order, for callers that
+	// need a flat string slice for exec.
 	Argv []string
 }
 
@@ -42,8 +48,8 @@ func New(idx *Index) *Matcher {
 }
 
 // FromSpec is a convenience constructor that builds the Index from a
-// spec and returns a ready-to-use Matcher. It returns an error if the
-// spec is invalid.
+// spec and returns a ready-to-use Matcher. It returns an error if
+// the spec is invalid.
 func FromSpec(spec *tool.ToolSpec) (*Matcher, error) {
 	idx, err := BuildIndex(spec)
 	if err != nil {
@@ -54,50 +60,76 @@ func FromSpec(spec *tool.ToolSpec) (*Matcher, error) {
 
 // Match validates a segment against the configured policy.
 //
-// On success, it returns a *Result describing which policy entry
-// governed the invocation. On failure, it returns a nil *Result and
-// an error. When the segment has multiple violations, all of them are
-// collected into a single Errors value so the caller can report the
-// complete diagnosis; single-violation failures return a *Error
-// directly.
+// On success returns a *Result describing which policy entry governed
+// the invocation. On failure returns a nil *Result plus an error.
+//
+// Routing-stage failures (unknown top-level command, or any token at
+// an intermediate level that doesn't name a known subcommand) return
+// a single *Error, fail-fast. There is no per-level pass-through:
+// strict routing requires every intermediate token to be a known sub.
+//
+// Validation-stage failures run only against the deepest matched
+// (leaf) entry: per-token allowed/disallowed checks plus the
+// missing-required check. The leaf's effective denylist is its own
+// DisallowedArgs unioned with every ancestor's
+// SubcommandsConfig.DisallowedSubArgs (recursive). All violations
+// from this stage are collected into an Errors so the caller can
+// show the agent every problem at once. A single-violation result is
+// promoted to *Error so callers can errors.As(*Error{}) for the
+// common case.
 func (m *Matcher) Match(seg Segment) (*Result, error) {
-	if len(seg.Words) == 0 {
-		return nil, &Error{
-			Code: ErrEmptySegment,
-			Msg:  "segment has no tokens",
-		}
+	if len(seg.Tokens) == 0 {
+		return nil, &Error{Code: ErrEmptySegment}
 	}
 
 	// Step 1: route to the top-level command entry.
-	cmdName := seg.Words[0]
-	top, ok := m.idx.byName[cmdName]
+	cmdTok := seg.Tokens[0]
+	top, ok := m.idx.byName[cmdTok.Value]
 	if !ok {
 		return nil, &Error{
 			Code:    ErrCommandNotAllowed,
-			Command: cmdName,
-			Token:   cmdName,
-			Msg:     "command is not in the allowed list",
+			Token:   cmdTok.Value,
+			Pos:     cmdTok.Pos,
+			Allowed: append([]string(nil), m.idx.names...),
 		}
 	}
 
-	// Step 2: route to a subcommand, if applicable.
+	// Step 2: route to the deepest subcommand match.
+	//
+	// At every level that has children, the next token MUST be a
+	// known sub. There's no "skip past parent flags" — if you want
+	// to permit a parent flag, model it as a sub of its own (see
+	// `--no-pager` in read_tool.yaml). The tradeoff of this strict
+	// routing is that intermediate levels' allowed/disallowed/
+	// required_args are dead config; only the leaf entry validates.
+	// In return, every accepted command is one whose full prefix
+	// path was explicitly listed in the policy.
+	//
+	// We descend while the current entry has subs and the args
+	// aren't exhausted. The loop terminates when we hit a leaf or
+	// run out of tokens.
 	governing := top
 	path := []string{top.name}
-	args := seg.Words[1:]
+	args := seg.Tokens[1:]
 
-	if len(top.subByName) > 0 && len(args) > 0 {
-		if sub, ok := top.subByName[args[0]]; ok {
-			governing = sub
-			path = append(path, sub.name)
-			args = args[1:]
+	for len(governing.subByName) > 0 && len(args) > 0 {
+		tok := args[0]
+		sub, ok := governing.subByName[tok.Value]
+		if !ok {
+			return nil, &Error{
+				Code:    ErrArgNotAllowed,
+				Command: strings.Join(path, " "),
+				Token:   tok.Value,
+				Pos:     tok.Pos,
+				Subs:    append([]string(nil), governing.subNames...),
+			}
 		}
-		// If args[0] is not a subcommand, fall through to the parent
-		// for validation. Per the policy model, an unrecognized
-		// would-be subcommand is just an arg that the parent must
-		// permit (or reject, in whitelist mode).
+		path = append(path, sub.name)
+		args = args[1:]
+		governing = sub
 	}
 
-	// Steps 3-5: validate args against the governing entry.
+	// Step 3: validate args against the governing entry.
 	errs := validateArgs(governing, path, args)
 	if !errs.ok() {
 		if len(errs) == 1 {
@@ -109,6 +141,14 @@ func (m *Matcher) Match(seg Segment) (*Result, error) {
 	return &Result{
 		Entry: governing.raw,
 		Path:  path,
-		Argv:  seg.Words,
+		Argv:  tokensToValues(seg.Tokens),
 	}, nil
+}
+
+func tokensToValues(toks []lex.Token) []string {
+	out := make([]string, len(toks))
+	for i, t := range toks {
+		out[i] = t.Value
+	}
+	return out
 }
