@@ -19,7 +19,8 @@ import (
 
 type tcase struct {
 	label string
-	cmd   string
+	base  string
+	argv  []string
 }
 
 type section struct {
@@ -83,160 +84,166 @@ func main() {
 			title: "Happy paths",
 			cases: []tcase{
 				{"bare top-level command (no subs to route through)",
-					"ls"},
+					"ls", nil},
 				{"orient: list tracked files",
-					"git --no-pager ls-files"},
+					"git", []string{"--no-pager", "ls-files"}},
 				{"oneline log with extra flags",
-					"git --no-pager log --oneline -20"},
+					"git", []string{"--no-pager", "log", "--oneline", "-20"}},
 				{"blame a file",
-					"git --no-pager blame README.md"},
-				{"quoted arg passes through as a single TokWord",
-					`git --no-pager grep "TODO"`},
+					"git", []string{"--no-pager", "blame", "README.md"}},
+				{"argv element passes through as a single TokWord",
+					"git", []string{"--no-pager", "grep", "TODO"}},
 				{"rg with multiple flags",
-					`rg "TODO" -A 5 --type go`},
+					"rg", []string{"TODO", "-A", "5", "--type", "go"}},
 				{"two-stage pipeline (cat | head)",
-					"cat README.md | head -20"},
+					"cat", []string{"README.md", "|", "head", "-20"}},
 				{"three-stage pipeline (ls | grep | wc)",
-					"git --no-pager ls-files | grep README | wc -l"},
-				{"find with allowed predicates",
-					`find . -name "*.go" -type f`},
+					"git", []string{"--no-pager", "ls-files", "|", "grep", "README", "|", "wc", "-l"}},
+				{"find with allowed predicates (glob arg auto-quoted)",
+					"find", []string{".", "-name", "*.go", "-type", "f"}},
 				{"safe disk usage check",
-					"du -sh ."},
+					"du", []string{"-sh", "."}},
 			},
 		},
 		{
-			title: "Lexer-stage rejections (never reach the matcher)",
+			// Note: under the argv API, elements that contain
+			// shell metacharacters are auto-quoted by joinArgv so
+			// they reach the matcher as literal tokens. Some of
+			// these cases therefore now reject at the matcher
+			// stage rather than the lexer stage; the rejection
+			// itself is preserved.
+			title: "Metacharacter inputs (lex- or matcher-stage rejection)",
 			cases: []tcase{
 				{"empty input",
-					""},
-				{"whitespace only",
-					"   "},
-				{"forbidden redirect operator",
-					"cat README.md > out.txt"},
-				{"forbidden && operator",
-					"ls && rm -rf /"},
-				{"forbidden ; sequencing",
-					"ls; rm -rf /"},
-				{"forbidden $ (variable expansion)",
-					"echo $HOME"},
-				{"forbidden backtick (command substitution)",
-					"echo `whoami`"},
-				{"forbidden glob expansion",
-					"ls *.go"},
-				{"forbidden brace expansion",
-					"ls {a,b}.go"},
-				{"unterminated quote",
-					`grep "unterminated`},
+					"", nil},
+				{"whitespace-only base",
+					"   ", nil},
+				{"redirect operator as argv element",
+					"cat", []string{"README.md", ">", "out.txt"}},
+				{"&& as argv element",
+					"ls", []string{"&&", "rm", "-rf", "/"}},
+				{"; as argv element",
+					"ls", []string{";", "rm", "-rf", "/"}},
+				{"$HOME as argv element",
+					"echo", []string{"$HOME"}},
+				{"backtick command sub as argv element",
+					"echo", []string{"`whoami`"}},
+				{"glob as argv element",
+					"ls", []string{"*.go"}},
+				{"brace expansion as argv element",
+					"ls", []string{"{a,b}.go"}},
+				{"argv element with stray double quote (lexer ErrUnterminatedQuote)",
+					"grep", []string{`"unterminated`}},
 			},
 		},
 		{
 			title: "Routing-stage rejections (strict subcommand match required)",
 			cases: []tcase{
 				{"unknown top-level command",
-					"rm -rf /"},
+					"rm", []string{"-rf", "/"}},
 				{"unknown command (typo)",
-					"cargo build"},
+					"cargo", []string{"build"}},
 				{"path-form command attempt",
-					"/bin/ls -la"},
+					"/bin/ls", []string{"-la"}},
 				{"unknown sub at depth 1 — git's only sub is --no-pager",
-					"git log --oneline"},
+					"git", []string{"log", "--oneline"}},
 				{"unknown sub at depth 2 — push isn't read-only",
-					"git --no-pager push origin main"},
+					"git", []string{"--no-pager", "push", "origin", "main"}},
 				{"typo'd sub at depth 2",
-					"git --no-pager lgo"},
+					"git", []string{"--no-pager", "lgo"}},
 				{"would-be flag in subcommand position (no fall-through)",
-					"git --no-pager --version"},
+					"git", []string{"--no-pager", "--version"}},
 			},
 		},
 		{
 			title: "Validation-stage rejections at the leaf",
 			cases: []tcase{
 				{"tail -f would block the agent loop",
-					"tail -f /var/log/syslog"},
+					"tail", []string{"-f", "/var/log/syslog"}},
 				{"tail --follow= regex denial",
-					"tail --follow=name /var/log/syslog"},
+					"tail", []string{"--follow=name", "/var/log/syslog"}},
 				{"find -exec is RCE",
-					"find . -exec rm {}"},
+					"find", []string{".", "-exec", "rm", "{}"}},
 				{"find -delete is destructive",
-					"find . -name old -delete"},
+					"find", []string{".", "-name", "old", "-delete"}},
 				{"git grep -O runs a command per match (RCE)",
-					"git --no-pager grep -O echo TODO"},
+					"git", []string{"--no-pager", "grep", "-O", "echo", "TODO"}},
 				{"blame --contents reads an arbitrary file",
-					"git --no-pager blame --contents=/etc/passwd README.md"},
+					"git", []string{"--no-pager", "blame", "--contents=/etc/passwd", "README.md"}},
 				{"rg --pre=<cmd> is RCE",
-					"rg --pre=cat TODO"},
+					"rg", []string{"--pre=cat", "TODO"}},
 				{"sort -o writes an arbitrary file",
-					"sort -o /tmp/leak data.txt"},
+					"sort", []string{"-o", "/tmp/leak", "data.txt"}},
 				{"date -s sets the system clock",
-					"date -s 1990-01-01"},
+					"date", []string{"-s", "1990-01-01"}},
 				{"diff --to-file= can bypass path policy",
-					"diff a.txt --to-file=/etc/shadow"},
+					"diff", []string{"a.txt", "--to-file=/etc/shadow"}},
 				{"file -C compiles magic files",
-					"file -C magic.mgc"},
+					"file", []string{"-C", "magic.mgc"}},
 				{"wc --files0-from reads an arbitrary file list",
-					"wc --files0-from=/tmp/list"},
+					"wc", []string{"--files0-from=/tmp/list"}},
 				{"ls-files --exclude-from reads an arbitrary file",
-					"git --no-pager ls-files --exclude-from=/tmp/x"},
+					"git", []string{"--no-pager", "ls-files", "--exclude-from=/tmp/x"}},
 			},
 		},
 		{
 			title: "Recursive disallow inheritance (declared once at git, reaches every leaf)",
 			cases: []tcase{
 				{"--textconv at log",
-					"git --no-pager log --textconv"},
+					"git", []string{"--no-pager", "log", "--textconv"}},
 				{"--textconv at show (same denial, different leaf)",
-					"git --no-pager show --textconv HEAD"},
+					"git", []string{"--no-pager", "show", "--textconv", "HEAD"}},
 				{"--ext-diff at status",
-					"git --no-pager status --ext-diff"},
+					"git", []string{"--no-pager", "status", "--ext-diff"}},
 				{"--output=… regex at log",
-					"git --no-pager log --output=/tmp/leak"},
+					"git", []string{"--no-pager", "log", "--output=/tmp/leak"}},
 				{`-- end-of-options marker is denied (prevents flag injection past it)`,
-					"git --no-pager log -- --textconv"},
+					"git", []string{"--no-pager", "log", "--", "--textconv"}},
 			},
 		},
 		{
 			title: "Multi-error collection at the leaf (single round-trip diagnosis)",
 			cases: []tcase{
 				{"three denied flags in one find call",
-					"find . -exec rm -delete -fprint /tmp/x"},
+					"find", []string{".", "-exec", "rm", "-delete", "-fprint", "/tmp/x"}},
 				{"own + inherited denial in the same segment",
-					"git --no-pager blame --contents=/etc/passwd --textconv README.md"},
+					"git", []string{"--no-pager", "blame", "--contents=/etc/passwd", "--textconv", "README.md"}},
 				{"same denied flag repeated three times",
-					"tail -f -f -f /var/log/syslog"},
+					"tail", []string{"-f", "-f", "-f", "/var/log/syslog"}},
 			},
 		},
 		{
 			title: "Pipeline-stage behavior",
 			cases: []tcase{
 				{"pass-through: every stage validates",
-					"cat README.md | grep TODO | wc -l"},
+					"cat", []string{"README.md", "|", "grep", "TODO", "|", "wc", "-l"}},
 				{"first segment passes, second denied",
-					"ls -la | grep -f patterns.txt"},
+					"ls", []string{"-la", "|", "grep", "-f", "patterns.txt"}},
 				{"long pipeline, middle segment denied",
-					`git --no-pager ls-files | grep --include-from=ignore.txt | wc -l`},
+					"git", []string{"--no-pager", "ls-files", "|", "grep", "--include-from=ignore.txt", "|", "wc", "-l"}},
 				{"final segment denied",
-					"cat data.txt | sort -o /tmp/leak"},
+					"cat", []string{"data.txt", "|", "sort", "-o", "/tmp/leak"}},
 				{"empty segment from a leading pipe",
-					"| ls -la"},
+					"|", []string{"ls", "-la"}},
 				{"empty segment from a trailing pipe",
-					"ls -la |"},
-				{"empty segment from || (consecutive pipes)",
-					"ls -la || grep foo"},
+					"ls", []string{"-la", "|"}},
+				{"empty segment from consecutive pipes",
+					"ls", []string{"-la", "|", "|", "grep", "foo"}},
 			},
 		},
 		{
 			title: "Boundary cases",
 			cases: []tcase{
 				{"single-character unknown command",
-					"a"},
+					"a", nil},
 				{"top-level with subs but no args (bare git)",
-					"git"},
+					"git", nil},
 				{"top-level + only the routing token (no leaf descent)",
-					"git --no-pager"},
+					"git", []string{"--no-pager"}},
 				{"identical command repeated through a pipeline",
-					"cat a.txt | cat | cat"},
+					"cat", []string{"a.txt", "|", "cat", "|", "cat"}},
 				{"long arg list, all OK",
-					"find . -type f -name a -name b -name c -name d -not -empty"},
+					"find", []string{".", "-type", "f", "-name", "a", "-name", "b", "-name", "c", "-name", "d", "-not", "-empty"}},
 			},
 		},
 		{
@@ -244,17 +251,17 @@ func main() {
 			specPath: hintPath,
 			cases: []tcase{
 				{"blacklist — hint fires: =-only regex, bare --file isn't denied",
-					"rg --file=patterns.txt"},
+					"rg", []string{"--file=patterns.txt"}},
 				{"blacklist — hint suppressed: (=.*)? regex covers both forms",
-					"diff --to-file=/etc/shadow"},
+					"diff", []string{"--to-file=/etc/shadow"}},
 				{"blacklist — following the hint: space-separated form passes",
-					"rg --file patterns.txt"},
+					"rg", []string{"--file", "patterns.txt"}},
 				{"whitelist — hint fires: bare --name is allowed, --name=alice isn't",
-					"probe --name=alice"},
+					"probe", []string{"--name=alice"}},
 				{"whitelist — same shape, different flag",
-					"probe --count=10"},
+					"probe", []string{"--count=10"}},
 				{"whitelist — following the hint still fails here because values must also be in the allow list",
-					"probe --name alice"},
+					"probe", []string{"--name", "alice"}},
 			},
 		},
 	}
@@ -271,8 +278,8 @@ func main() {
 		for _, tc := range sec.cases {
 			caseN++
 			fmt.Printf("──────── case %d: %s\n", caseN, tc.label)
-			fmt.Printf("$ %s\n", tc.cmd)
-			r := p.Parse(path, tc.cmd)
+			fmt.Printf("$ %s\n", display(tc.base, tc.argv))
+			r := p.Parse(path, tc.base, tc.argv)
 			if r.Pass {
 				fmt.Printf("  → PASS  (rule: %s)\n\n", r.Rule)
 				continue
@@ -284,6 +291,16 @@ func main() {
 			fmt.Println()
 		}
 	}
+}
+
+// display renders a base + argv invocation as a shell-like string for
+// the "$ ..." line in the demo output. It is purely for human reading;
+// the parser receives base and argv directly, not this string.
+func display(base string, argv []string) string {
+	if len(argv) == 0 {
+		return base
+	}
+	return base + " " + strings.Join(argv, " ")
 }
 
 // writeTempSpec writes content to a temp YAML file and returns the

@@ -22,7 +22,7 @@ func mustParser(t *testing.T) *Parser {
 
 func TestParse_GitLogHappyPath(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git --no-pager log --no-pager --oneline")
+	r := p.Parse(readToolYAML, "git", []string{"--no-pager", "log", "--no-pager", "--oneline"})
 	if !r.Pass {
 		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
 	}
@@ -33,7 +33,7 @@ func TestParse_GitLogHappyPath(t *testing.T) {
 
 func TestParse_GitLogTextconvDenied(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git --no-pager log --no-pager --textconv")
+	r := p.Parse(readToolYAML, "git", []string{"--no-pager", "log", "--no-pager", "--textconv"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -55,7 +55,7 @@ func TestParse_GitLogTextconvDenied(t *testing.T) {
 
 func TestParse_GitPushUnknownSubcommand(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git push origin")
+	r := p.Parse(readToolYAML, "git", []string{"push", "origin"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -89,7 +89,7 @@ func TestParse_GitPushUnknownSubcommand(t *testing.T) {
 
 func TestParse_PipelineHappyPath(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls -la | grep foo")
+	r := p.Parse(readToolYAML, "ls", []string{"-la", "|", "grep", "foo"})
 	if !r.Pass {
 		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
 	}
@@ -97,7 +97,7 @@ func TestParse_PipelineHappyPath(t *testing.T) {
 
 func TestParse_PipelineSecondSegmentDenied(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls -la | grep -f patterns.txt")
+	r := p.Parse(readToolYAML, "ls", []string{"-la", "|", "grep", "-f", "patterns.txt"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -124,8 +124,8 @@ func TestParse_PipelineSecondSegmentDenied(t *testing.T) {
 
 func TestParse_CacheReusesMatcher(t *testing.T) {
 	p := mustParser(t)
-	r1 := p.Parse(readToolYAML, "ls -la")
-	r2 := p.Parse(readToolYAML, "ls -la")
+	r1 := p.Parse(readToolYAML, "ls", []string{"-la"})
+	r2 := p.Parse(readToolYAML, "ls", []string{"-la"})
 	if !r1.Pass || !r2.Pass {
 		t.Fatalf("expected both passes; r1=%v r2=%v", r1.Reason, r2.Reason)
 	}
@@ -136,7 +136,7 @@ func TestParse_CacheReusesMatcher(t *testing.T) {
 
 func TestParse_MissingFile(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse("/nonexistent/path/spec.yaml", "ls -la")
+	r := p.Parse("/nonexistent/path/spec.yaml", "ls", []string{"-la"})
 	if r.Pass {
 		t.Fatal("expected Pass=false for missing file")
 	}
@@ -147,12 +147,97 @@ func TestParse_MissingFile(t *testing.T) {
 
 func TestParse_LexerError(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls > out.txt")
+	r := p.Parse(readToolYAML, "ls", []string{">", "out.txt"})
 	if r.Pass {
 		t.Fatal("expected Pass=false for forbidden char")
 	}
 	if r.Reason == nil {
 		t.Fatal("expected non-nil Reason")
+	}
+}
+
+func TestJoinArgv(t *testing.T) {
+	tests := []struct {
+		name string
+		base string
+		argv []string
+		want string
+	}{
+		{
+			name: "empty input yields empty string",
+			base: "",
+			argv: nil,
+			want: "",
+		},
+		{
+			name: "base only, no args",
+			base: "ls",
+			argv: nil,
+			want: "ls",
+		},
+		{
+			name: "plain args need no quoting",
+			base: "git",
+			argv: []string{"--no-pager", "log", "--oneline"},
+			want: "git --no-pager log --oneline",
+		},
+		{
+			name: "arg with whitespace is double-quoted",
+			base: "git",
+			argv: []string{"commit", "-m", "hello world"},
+			want: `git commit -m "hello world"`,
+		},
+		{
+			name: "arg with embedded double quote uses single quotes",
+			base: "echo",
+			argv: []string{`say "hi"`},
+			want: `echo 'say "hi"'`,
+		},
+		{
+			name: "arg with embedded single quote uses double quotes",
+			base: "echo",
+			argv: []string{"it's"},
+			want: `echo "it's"`,
+		},
+		{
+			name: "arg with literal pipe is quoted (preserves single segment)",
+			base: "rg",
+			argv: []string{"foo|bar"},
+			want: `rg "foo|bar"`,
+		},
+		{
+			name: "bare pipe element passes through as pipeline boundary",
+			base: "ls",
+			argv: []string{"-la", "|", "wc", "-l"},
+			want: "ls -la | wc -l",
+		},
+		{
+			name: "arg with metachar gets quoted to round-trip as one token",
+			base: "find",
+			argv: []string{".", "-name", "*.go", "-type", "f"},
+			want: `find . -name "*.go" -type f`,
+		},
+		{
+			name: "arg containing dollar sign is quoted",
+			base: "echo",
+			argv: []string{"$HOME"},
+			want: `echo "$HOME"`,
+		},
+		{
+			name: "empty arg becomes empty quoted token",
+			base: "cmd",
+			argv: []string{"a", "", "b"},
+			want: `cmd a "" b`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := joinArgv(tc.base, tc.argv)
+			if got != tc.want {
+				t.Errorf("joinArgv(%q, %#v)\n  got:  %q\n  want: %q",
+					tc.base, tc.argv, got, tc.want)
+			}
+		})
 	}
 }
 
