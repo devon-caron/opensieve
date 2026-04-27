@@ -1,4 +1,4 @@
-package parser
+package opensieve
 
 import (
 	"fmt"
@@ -19,8 +19,8 @@ import (
 // calls for the same tool reuse the built Index instead of re-reading
 // the YAML and re-compiling every regex/path pattern.
 type Parser struct {
-	mu      sync.Mutex
-	loaded  map[string]*loadedSpec
+	mu     sync.Mutex
+	loaded map[string]*loadedSpec
 }
 
 // loadedSpec bundles a parsed ToolSpec with the Matcher built from it.
