@@ -2,7 +2,6 @@ package opensieve
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -52,13 +51,13 @@ type ParseResult struct {
 // cmd against it. cmd may contain pipes; each pipeline segment is
 // matched independently in order, and Parse fails fast on the first
 // segment that doesn't pass.
-func (p *Parser) Parse(toolPath string, cmd string) ParseResult {
-	ls, err := p.load(toolPath)
+func (p *Parser) Parse(toolData string, cmd string) ParseResult {
+	ls, err := p.load([]byte(toolData))
 	if err != nil {
 		return ParseResult{
 			Pass:   false,
 			Reason: err,
-			Rule:   "Tool path: " + toolPath,
+			Rule:   "Tool data: " + toolData,
 		}
 	}
 
@@ -93,31 +92,22 @@ func (p *Parser) Parse(toolPath string, cmd string) ParseResult {
 // load reads, parses, and compiles the YAML at path, caching the
 // result. Subsequent calls for the same path return the cached entry
 // without touching the file system or rebuilding the Index.
-func (p *Parser) load(path string) (*loadedSpec, error) {
+func (p *Parser) load(toolData []byte) (*loadedSpec, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if ls, ok := p.loaded[path]; ok {
-		return ls, nil
-	}
-
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
 	spec := &tool.ToolSpec{}
-	if err := yaml.Unmarshal(bytes, spec); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+	if err := yaml.Unmarshal(toolData, spec); err != nil {
+		return nil, fmt.Errorf("parse tool data: %w", err)
 	}
 
 	matcher, err := match.FromSpec(spec)
 	if err != nil {
-		return nil, fmt.Errorf("compile %s: %w", path, err)
+		return nil, fmt.Errorf("compile tool data: %w", err)
 	}
 
 	ls := &loadedSpec{spec: spec, matcher: matcher}
-	p.loaded[path] = ls
+	p.loaded[string(toolData)] = ls
 	return ls, nil
 }
 
