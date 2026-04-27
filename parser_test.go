@@ -232,13 +232,159 @@ func TestJoinArgv(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := joinArgv(tc.base, tc.argv)
+			got := JoinArgv(tc.base, tc.argv)
 			if got != tc.want {
-				t.Errorf("joinArgv(%q, %#v)\n  got:  %q\n  want: %q",
+				t.Errorf("JoinArgv(%q, %#v)\n  got:  %q\n  want: %q",
 					tc.base, tc.argv, got, tc.want)
 			}
 		})
 	}
+}
+
+func TestSeparateCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantBase string
+		wantArgv []string
+	}{
+		{
+			name:     "single bare command",
+			input:    "ls",
+			wantBase: "ls",
+			wantArgv: []string{},
+		},
+		{
+			name:     "command with plain args",
+			input:    "git --no-pager log --oneline",
+			wantBase: "git",
+			wantArgv: []string{"--no-pager", "log", "--oneline"},
+		},
+		{
+			name:     "double-quoted arg with whitespace becomes single element",
+			input:    `git commit -m "hello world"`,
+			wantBase: "git",
+			wantArgv: []string{"commit", "-m", "hello world"},
+		},
+		{
+			name:     "single-quoted arg with embedded double quote",
+			input:    `echo 'say "hi"'`,
+			wantBase: "echo",
+			wantArgv: []string{`say "hi"`},
+		},
+		{
+			name:     "metachar inside quotes survives as literal element",
+			input:    `find . -name "*.go"`,
+			wantBase: "find",
+			wantArgv: []string{".", "-name", "*.go"},
+		},
+		{
+			name:     "empty quoted element is preserved",
+			input:    `cmd "" arg`,
+			wantBase: "cmd",
+			wantArgv: []string{"", "arg"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotBase, gotArgv, err := SeparateCommand(tc.input)
+			if err != nil {
+				t.Fatalf("SeparateCommand(%q): unexpected error: %v",
+					tc.input, err)
+			}
+			if gotBase != tc.wantBase {
+				t.Errorf("base: got %q, want %q", gotBase, tc.wantBase)
+			}
+			if !stringSlicesEqual(gotArgv, tc.wantArgv) {
+				t.Errorf("argv: got %#v, want %#v", gotArgv, tc.wantArgv)
+			}
+		})
+	}
+}
+
+func TestSeparateCommand_Errors(t *testing.T) {
+	t.Run("empty input returns lex error", func(t *testing.T) {
+		_, _, err := SeparateCommand("")
+		if err == nil {
+			t.Fatal("expected error on empty input")
+		}
+		if errors.Is(err, ErrPipeInSingleCommand) {
+			t.Errorf("empty input should not return ErrPipeInSingleCommand")
+		}
+	})
+
+	t.Run("pipe operator returns ErrPipeInSingleCommand", func(t *testing.T) {
+		_, _, err := SeparateCommand("ls -la | wc -l")
+		if !errors.Is(err, ErrPipeInSingleCommand) {
+			t.Errorf("got %v, want ErrPipeInSingleCommand", err)
+		}
+	})
+
+	t.Run("forbidden char returns lex error", func(t *testing.T) {
+		_, _, err := SeparateCommand("ls > out.txt")
+		if err == nil {
+			t.Fatal("expected error on forbidden char")
+		}
+		var lerr *lex.Error
+		if !errors.As(err, &lerr) {
+			t.Fatalf("expected *lex.Error, got %T", err)
+		}
+	})
+}
+
+// TestArgvRoundTrip locks in the inverse property: for any argv shape
+// JoinArgv produces, SeparateCommand returns the original (base, argv).
+// This is the contract callers rely on when moving between the two
+// representations.
+func TestArgvRoundTrip(t *testing.T) {
+	cases := []struct {
+		base string
+		argv []string
+	}{
+		{"ls", nil},
+		{"git", []string{"--no-pager", "log", "--oneline"}},
+		{"git", []string{"commit", "-m", "hello world"}},
+		{"echo", []string{`say "hi"`}},
+		{"echo", []string{"it's"}},
+		{"find", []string{".", "-name", "*.go", "-type", "f"}},
+		{"echo", []string{"$HOME"}},
+		{"cmd", []string{"a", "", "b"}},
+		{"rg", []string{"a|b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.base+"_"+strings.Join(tc.argv, "_"), func(t *testing.T) {
+			joined := JoinArgv(tc.base, tc.argv)
+			gotBase, gotArgv, err := SeparateCommand(joined)
+			if err != nil {
+				t.Fatalf("round-trip failed: JoinArgv → %q, "+
+					"SeparateCommand error: %v", joined, err)
+			}
+			if gotBase != tc.base {
+				t.Errorf("base mismatch: joined=%q got=%q want=%q",
+					joined, gotBase, tc.base)
+			}
+			wantArgv := tc.argv
+			if wantArgv == nil {
+				wantArgv = []string{}
+			}
+			if !stringSlicesEqual(gotArgv, wantArgv) {
+				t.Errorf("argv mismatch: joined=%q\n  got:  %#v\n  want: %#v",
+					joined, gotArgv, wantArgv)
+			}
+		})
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSplitSegments_PipelineCounts(t *testing.T) {

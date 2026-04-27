@@ -1,6 +1,7 @@
 package opensieve
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -77,7 +78,7 @@ func (p *Parser) Parse(toolData string, base string, argv []string) ParseResult 
 
 	ruleName := ls.spec.Name
 
-	cmd := joinArgv(base, argv)
+	cmd := JoinArgv(base, argv)
 
 	tokens, err := lex.Tokenize(cmd)
 	if err != nil {
@@ -127,16 +128,22 @@ func (p *Parser) load(toolData []byte) (*loadedSpec, error) {
 	return ls, nil
 }
 
-// joinArgv reconstructs a command string from a base command name and
-// an argv slice for consumption by lex.Tokenize. Elements that contain
-// whitespace, the pipe operator, or quote characters are wrapped in
-// quotes so that each argv element survives tokenization as a single
-// token.
+// JoinArgv reconstructs a command string from a base command name and
+// an argv slice for consumption by the lexer. Elements that would not
+// survive tokenization as a single unquoted word are wrapped in quotes
+// so that each argv element comes out the other side of lex.Tokenize
+// as exactly one TokWord.
 //
+// JoinArgv and SeparateCommand are exposed so that callers — and other
+// projects that integrate with opensieve — can move between the two
+// representations through the same canonical implementation that
+// Parser.Parse uses internally.
+//
+// A bare "|" element is the pipeline-boundary marker (see quoteArg).
 // When both base and argv are empty, the result is the empty string so
-// that Tokenize surfaces ErrEmptyInput rather than emitting a
+// that lex.Tokenize surfaces ErrEmptyInput rather than emitting a
 // quoted-empty-string token.
-func joinArgv(base string, argv []string) string {
+func JoinArgv(base string, argv []string) string {
 	if base == "" && len(argv) == 0 {
 		return ""
 	}
@@ -147,6 +154,48 @@ func joinArgv(base string, argv []string) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// SeparateCommand parses a command string into a base command name and
+// the argv slice that follows it, using the canonical lexer. It is the
+// inverse of JoinArgv: for any (base, argv) whose JoinArgv result
+// tokenizes cleanly, SeparateCommand(JoinArgv(base, argv)) returns the
+// original (base, argv).
+//
+// SeparateCommand handles a single command segment only. If cmd
+// contains a pipe operator, it returns ErrPipeInSingleCommand;
+// callers with pipelines should split into segments first (or call
+// Parser.Parse, which handles pipelines internally). Lexer errors
+// (forbidden chars, unterminated quotes, empty input, etc.) are
+// returned verbatim.
+func SeparateCommand(cmd string) (base string, argv []string, err error) {
+	tokens, err := lex.Tokenize(cmd)
+	if err != nil {
+		return "", nil, err
+	}
+	words := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		switch t.Kind {
+		case lex.TokWord:
+			words = append(words, t.Value)
+		case lex.TokPipe:
+			return "", nil, ErrPipeInSingleCommand
+		case lex.TokEOF:
+			// terminator, ignore
+		}
+	}
+	// lex.Tokenize guarantees ErrEmptyInput on whitespace-only input,
+	// so words is always non-empty here when err is nil.
+	return words[0], words[1:], nil
+}
+
+// ErrPipeInSingleCommand is returned by SeparateCommand when its input
+// contains a pipe operator. SeparateCommand handles a single segment
+// only; callers expecting pipelines should route through Parser.Parse
+// (which handles segmentation internally) or split the input into
+// segments and call SeparateCommand on each.
+var ErrPipeInSingleCommand = errors.New(
+	"opensieve: SeparateCommand received a pipeline; use Parser.Parse " +
+		"or split into segments first")
 
 // quoteArg wraps s in quotes whenever any of its characters would not
 // survive the lexer as part of a single unquoted word. The intent is
