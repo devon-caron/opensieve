@@ -48,10 +48,24 @@ type ParseResult struct {
 }
 
 // Parse loads (or reuses cached) the spec at toolPath and validates
-// cmd against it. cmd may contain pipes; each pipeline segment is
-// matched independently in order, and Parse fails fast on the first
-// segment that doesn't pass.
-func (p *Parser) Parse(toolData string, cmd string) ParseResult {
+// the candidate invocation, given as a base command name and an argv
+// slice, against it. argv is the list of arguments that follow base,
+// in order, with each element representing one already-tokenized word
+// (no shell quoting required from the caller).
+//
+// Internally, base and argv are reassembled into a single command
+// string and fed through the existing lexer; quoting is applied to any
+// element containing whitespace, the pipe operator, or a quote
+// character so that each element survives tokenization as a single
+// token. Elements containing characters that the lexer forbids outside
+// quotes (e.g. $, *, redirection operators) will be rejected at the
+// lex stage; this preserves the policy that those characters are not
+// permitted inputs.
+//
+// argv may include a literal "|" element to express a pipeline; each
+// pipeline segment is matched independently in order, and Parse fails
+// fast on the first segment that doesn't pass.
+func (p *Parser) Parse(toolData string, base string, argv []string) ParseResult {
 	ls, err := p.load([]byte(toolData))
 	if err != nil {
 		return ParseResult{
@@ -62,6 +76,8 @@ func (p *Parser) Parse(toolData string, cmd string) ParseResult {
 	}
 
 	ruleName := ls.spec.Name
+
+	cmd := joinArgv(base, argv)
 
 	tokens, err := lex.Tokenize(cmd)
 	if err != nil {
@@ -109,6 +125,107 @@ func (p *Parser) load(toolData []byte) (*loadedSpec, error) {
 	ls := &loadedSpec{spec: spec, matcher: matcher}
 	p.loaded[string(toolData)] = ls
 	return ls, nil
+}
+
+// joinArgv reconstructs a command string from a base command name and
+// an argv slice for consumption by lex.Tokenize. Elements that contain
+// whitespace, the pipe operator, or quote characters are wrapped in
+// quotes so that each argv element survives tokenization as a single
+// token.
+//
+// When both base and argv are empty, the result is the empty string so
+// that Tokenize surfaces ErrEmptyInput rather than emitting a
+// quoted-empty-string token.
+func joinArgv(base string, argv []string) string {
+	if base == "" && len(argv) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 1+len(argv))
+	parts = append(parts, quoteArg(base))
+	for _, a := range argv {
+		parts = append(parts, quoteArg(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+// quoteArg wraps s in quotes whenever any of its characters would not
+// survive the lexer as part of a single unquoted word. The intent is
+// "one argv element in, one TokWord out" so callers don't have to know
+// the lexer's character classes.
+//
+// A bare "|" element is the pipeline-boundary marker and is emitted
+// unquoted so that the lexer produces a TokPipe token; this is how
+// callers express pipelines through the argv API. Any element that
+// contains "|" mixed with other content is quoted instead, so a single
+// argv element never crosses a segment boundary.
+//
+// The lexer treats single and double quotes as equivalent literal
+// delimiters with no escape processing. quoteArg therefore prefers
+// double quotes; falls back to single quotes when s contains a literal
+// double quote; and falls back to double quotes when s contains both,
+// which is unrepresentable through the current lexer's no-escape
+// contract — Tokenize will surface ErrUnterminatedQuote in that case,
+// which is the expected failure mode rather than silent corruption.
+// Likewise, elements containing newlines or other always-forbidden
+// control characters cannot round-trip through any quoting and will
+// be rejected by Tokenize with ErrForbiddenChar.
+//
+// An empty string is emitted as "" so that empty argv elements survive
+// as zero-value tokens rather than being elided by the joiner.
+func quoteArg(s string) string {
+	if s == "" {
+		return `""`
+	}
+	if s == "|" {
+		return s
+	}
+	needsQuote := false
+	hasDouble := false
+	hasSingle := false
+	for _, r := range s {
+		switch r {
+		case '"':
+			needsQuote = true
+			hasDouble = true
+		case '\'':
+			needsQuote = true
+			hasSingle = true
+		default:
+			if !isUnquotedSafe(r) {
+				needsQuote = true
+			}
+		}
+	}
+	if !needsQuote {
+		return s
+	}
+	if !hasDouble {
+		return `"` + s + `"`
+	}
+	if !hasSingle {
+		return "'" + s + "'"
+	}
+	return `"` + s + `"`
+}
+
+// isUnquotedSafe reports whether r is permitted inside an unquoted
+// word by the lexer. It mirrors lex/chars.go's isWordChar; if that
+// set ever widens or narrows there, this must move in lockstep or
+// joinArgv will start under- or over-quoting.
+func isUnquotedSafe(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	}
+	switch r {
+	case '-', '_', '.', '/', '=', '+', ':', ',', '@', '%':
+		return true
+	}
+	return false
 }
 
 // splitSegments groups tokens into match.Segment values at TokPipe
