@@ -4,9 +4,9 @@ description: |
 
   How an LLM agent should investigate a codebase in response to a user prompt, using only this allowed command set:
 
-  `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `grep`, `rg`, `find`, `diff`, `sort`, `uniq`, `cut`, `tr`, `ps`, `df`, `du`, `uname`, `whoami`, `date`, `git` (read-only subcommands).
+  'ls', 'cat', 'head', 'tail', 'wc', 'file', 'stat', 'grep', 'rg', 'find', 'diff', 'sort', 'uniq', 'cut', 'tr', 'ps', 'df', 'du', 'uname', 'whoami', 'date', 'git' (read-only subcommands).
 
-  Note: `tree` and `sed` are unavailable — use `find` or `ls -R` for directory structure, and `head`/`tail` combinations for line ranges.
+  Note: 'tree' and 'sed' are unavailable — use 'find' or 'ls -R' for directory structure, and 'head'/'tail' combinations for line ranges.
 
   ## The core loop
 
@@ -16,60 +16,60 @@ description: |
   4. **Verify** — cross-check against git history, tests, or call sites.
   5. **Report** — synthesize with file paths and line numbers so the user can verify.
 
-  Skipping step 1 is the most common failure: agents that `grep` for the user's keyword immediately often miss that the codebase uses different terminology or that the answer is in the README.
+  Skipping step 1 is the most common failure: agents that 'grep' for the user's keyword immediately often miss that the codebase uses different terminology or that the answer is in the README.
 
   ## Step 1: Orient
 
-  ```bash
+  (bash)
   ls -la
   cat README.md
   cat package.json                         # or pyproject.toml, Cargo.toml, go.mod
   find . -maxdepth 2 -type d
   git --no-pager ls-files | head -50
   git --no-pager log --oneline -20
-  ```
+  (end bash)
 
-  The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. `git ls-files` beats `find` for "what's in this project" because it respects `.gitignore`.
+  The manifest file is gold — language, framework, dependencies, entry points, test runner in one read. 'git ls-files' beats 'find' for "what's in this project" because it respects '.gitignore'.
 
   ## Step 2: Locate
 
-  ```bash
+  (bash)
   rg "PaymentProcessor"
   rg -l "PaymentProcessor"
   rg -t py "class.*Processor"
   rg -A 5 -B 2 "def process_payment"
-  ```
+  (end bash)
 
   Strategy by question type:
 
-  - **"Where is X defined?"** → `rg "(class|def|function|fn)\s+X"`
-  - **"Where is X used?"** → `rg "\bX\b"` with word boundaries
-  - **"How does auth work?"** → `rg -i "auth|login|session|token"`. Cast wide, then narrow.
-  - **"What configures Y?"** → `find . -name '*.yaml' -o -name '*.toml'`, then grep within.
-  - **"What broke in feature Z?"** → `git --no-pager log -S "string"` (pickaxe).
+  - **"Where is X defined?"** → 'rg "(class|def|function|fn)\s+X"'
+  - **"Where is X used?"** → 'rg "\bX\b"' with word boundaries
+  - **"How does auth work?"** → 'rg -i "auth|login|session|token"'. Cast wide, then narrow.
+  - **"What configures Y?"** → 'find . -name '*.yaml' -o -name '*.toml'', then grep within.
+  - **"What broke in feature Z?"** → 'git --no-pager log -S "string"' (pickaxe).
 
-  Hotspots: `rg -l "TODO" | cut -d/ -f2 | sort | uniq -c | sort -rn`.
+  Hotspots: 'rg -l "TODO" | cut -d/ -f2 | sort | uniq -c | sort -rn'.
 
   ## Step 3: Read
 
-  ```bash
+  (bash)
   wc -l path/file.py                       # size first
   head -50 path/file.py                    # imports + structure
   head -180 path/file.py | tail -60        # lines 121-180
   rg -n "def process_payment" -A 40 path/file.py
-  ```
+  (end bash)
 
-  No `sed`: use `head -B | tail -(B-A+1)` for ranges. Read imports first — reveals related code faster than another search. Trace calls by alternating `rg -n "def X"`, `rg -n "X\("`, `rg -n "import X"`.
+  No 'sed': use 'head -B | tail -(B-A+1)' for ranges. Read imports first — reveals related code faster than another search. Trace calls by alternating 'rg -n "def X"', 'rg -n "X\("', 'rg -n "import X"'.
 
   ## Step 4: Verify
 
-  ```bash
+  (bash)
   git --no-pager log --oneline -- path/file.py
   git --no-pager blame path/file.py | head -30
   git --no-pager log -p -S "function_name"
   find . -path '*/test*' -name '*payment*'
   diff old.py new.py
-  ```
+  (end bash)
 
   Tests beat docstrings — they execute. Contradicts your conclusion? You're wrong.
 
@@ -77,40 +77,40 @@ description: |
 
   Cite path and line for every claim.
 
-  ✅ "Auth in `src/auth/session.py:42` via `SessionManager.authenticate()`; validates against `src/auth/store.py`; JWT from `config/auth.yaml`. Tests: `tests/auth/test_session.py:15-80`."
+  ✅ "Auth in 'src/auth/session.py:42' via 'SessionManager.authenticate()'; validates against 'src/auth/store.py'; JWT from 'config/auth.yaml'. Tests: 'tests/auth/test_session.py:15-80'."
 
   ❌ "The codebase uses a SessionManager class with JWTs."
 
   ## Worked example: "How does this app handle uploads?"
 
-  - **Orient:** `cat package.json` → Express + `multer`. Strong lead.
-  - **Locate:** `rg -l "multer"` → middleware, route, test. `rg -l "upload"` adds `src/services/storage.js`.
-  - **Read:** `wc -l` each; `cat` small ones; `rg -n "upload" -A 20 src/routes/files.js` for the big one.
-  - **Verify:** `cat tests/upload.test.js`; `git --no-pager log` shows recent activity.
-  - **Report:** "Multer in `src/middleware/upload.js:12` limits to 10MB images. Routes `src/routes/files.js:45-80` call `StorageService.persist()` in `src/services/storage.js` (→ S3). Tests cover size, MIME, S3 failures."
+  - **Orient:** (bash) 'cat package.json' → Express + 'multer'. Strong lead.
+  - **Locate:** 'rg -l "multer"' → middleware, route, test. 'rg -l "upload"' adds 'src/services/storage.js'.
+  - **Read:** 'wc -l' each; 'cat' small ones; 'rg -n "upload" -A 20 src/routes/files.js' for the big one.
+  - **Verify:** 'cat tests/upload.test.js'; 'git --no-pager log' shows recent activity.
+  - **Report:** "Multer in 'src/middleware/upload.js:12' limits to 10MB images. Routes 'src/routes/files.js:45-80' call 'StorageService.persist()' in 'src/services/storage.js' (→ S3). Tests cover size, MIME, S3 failures."
 
   ## Anti-patterns
 
   - Searching before orienting.
-  - `cat` on large files — `wc -l` then `rg -n -A/-B`.
+  - 'cat' on large files — 'wc -l' then 'rg -n -A/-B'.
   - Trusting comments over code, tests, recent commits.
   - One search, one conclusion — cross-reference first.
   - Reporting without paths — if you can't cite it, you don't know it.
-  - Raw `find`/`grep -r` on big repos — prefer `rg`, `git ls-files`.
+  - Raw 'find'/'grep -r' on big repos — prefer 'rg', 'git ls-files'.
 
   ## Quick reference
 
   | Purpose | Command |
   |---|---|
-  | List project files | `git ls-files`, `ls -la` |
-  | Directory shape | `find . -maxdepth 2 -type d \| sort` |
-  | Search | `rg` (fallback `grep -rn`) |
-  | Line range | `head -B file \| tail -(B-A+1)` |
-  | Size/info | `wc -l`, `stat`, `file` |
-  | History | `git log`, `git log -S`, `git blame` |
-  | Diff | `git show`, `git diff`, `diff` |
-  | Find tests | `find . -path '*test*'` |
-  | Hotspots | `rg -l ... \| cut \| sort \| uniq -c` |
+  | List project files | 'git ls-files', 'ls -la' |
+  | Directory shape | 'find . -maxdepth 2 -type d \| sort' |
+  | Search | 'rg' (fallback 'grep -rn') |
+  | Line range | 'head -B file \| tail -(B-A+1)' |
+  | Size/info | 'wc -l', 'stat', 'file' |
+  | History | 'git log', 'git log -S', 'git blame' |
+  | Diff | 'git show', 'git diff', 'diff' |
+  | Find tests | 'find . -path '*test*'' |
+  | Hotspots | 'rg -l ... \| cut \| sort \| uniq -c' |
 
   Most questions resolve in 5-15 commands. 50+ means skipping step 1 or 4.
 
@@ -154,7 +154,7 @@ commands:
   # DO NOT add without understanding the implications.
   #
   # Parent's allowed_args / required_args govern ONLY the top-level
-  # `git <flags> <subcommand>` portion — they do not apply to
+  # 'git <flags> <subcommand>' portion — they do not apply to
   # subcommands. DRY inheritance for subcommands lives in
   # subcommands.
   - command: git
