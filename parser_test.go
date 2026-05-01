@@ -2,6 +2,7 @@ package opensieve
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -9,7 +10,17 @@ import (
 	"github.com/devon-caron/opensieve/match"
 )
 
-const readToolYAML = "read_tool.yaml"
+// mustReadYAML reads the YAML file and returns its content.
+// This is needed because Parser.Parse() expects YAML content as a string,
+// not a file path.
+func mustReadYAML(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("read_tool.yaml")
+	if err != nil {
+		t.Fatalf("read read_tool.yaml: %v", err)
+	}
+	return string(data)
+}
 
 func mustParser(t *testing.T) *Parser {
 	t.Helper()
@@ -22,7 +33,8 @@ func mustParser(t *testing.T) *Parser {
 
 func TestParse_GitLogHappyPath(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git", []string{"--no-pager", "log", "--no-pager", "--oneline"})
+	yaml := mustReadYAML(t)
+	r := p.Parse(yaml, "git", []string{"--no-pager", "log", "--no-pager", "--oneline"})
 	if !r.Pass {
 		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
 	}
@@ -33,7 +45,8 @@ func TestParse_GitLogHappyPath(t *testing.T) {
 
 func TestParse_GitLogTextconvDenied(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git", []string{"--no-pager", "log", "--no-pager", "--textconv"})
+	yaml := mustReadYAML(t)
+	r := p.Parse(yaml, "git", []string{"--no-pager", "log", "--no-pager", "--textconv"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -55,7 +68,8 @@ func TestParse_GitLogTextconvDenied(t *testing.T) {
 
 func TestParse_GitPushUnknownSubcommand(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "git", []string{"push", "origin"})
+	yaml := mustReadYAML(t)
+	r := p.Parse(yaml, "git", []string{"push", "origin"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -89,7 +103,8 @@ func TestParse_GitPushUnknownSubcommand(t *testing.T) {
 
 func TestParse_PipelineHappyPath(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls", []string{"-la", "|", "grep", "foo"})
+	yaml := mustReadYAML(t)
+	r := p.Parse(yaml, "ls", []string{"-la", "|", "grep", "foo"})
 	if !r.Pass {
 		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
 	}
@@ -97,7 +112,8 @@ func TestParse_PipelineHappyPath(t *testing.T) {
 
 func TestParse_PipelineSecondSegmentDenied(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls", []string{"-la", "|", "grep", "-f", "patterns.txt"})
+	yaml := mustReadYAML(t)
+	r := p.Parse(yaml, "ls", []string{"-la", "|", "grep", "-f", "patterns.txt"})
 	if r.Pass {
 		t.Fatal("expected Pass=false")
 	}
@@ -124,8 +140,9 @@ func TestParse_PipelineSecondSegmentDenied(t *testing.T) {
 
 func TestParse_CacheReusesMatcher(t *testing.T) {
 	p := mustParser(t)
-	r1 := p.Parse(readToolYAML, "ls", []string{"-la"})
-	r2 := p.Parse(readToolYAML, "ls", []string{"-la"})
+	yaml := mustReadYAML(t)
+	r1 := p.Parse(yaml, "ls", []string{"-la"})
+	r2 := p.Parse(yaml, "ls", []string{"-la"})
 	if !r1.Pass || !r2.Pass {
 		t.Fatalf("expected both passes; r1=%v r2=%v", r1.Reason, r2.Reason)
 	}
@@ -147,7 +164,9 @@ func TestParse_MissingFile(t *testing.T) {
 
 func TestParse_LexerError(t *testing.T) {
 	p := mustParser(t)
-	r := p.Parse(readToolYAML, "ls", []string{">", "out.txt"})
+	yaml := mustReadYAML(t)
+	// Use a control character that the lexer rejects even inside quotes.
+	r := p.Parse(yaml, "ls", []string{"\x01"})
 	if r.Pass {
 		t.Fatal("expected Pass=false for forbidden char")
 	}
@@ -241,6 +260,9 @@ func TestJoinArgv(t *testing.T) {
 	}
 }
 
+// TestSeparateCommand tests the deprecated SeparateCommand function
+// which only handles single-segment commands. For pipelines, use
+// SeparateCommands instead.
 func TestSeparateCommand(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -332,6 +354,162 @@ func TestSeparateCommand_Errors(t *testing.T) {
 	})
 }
 
+// TestSeparateCommands tests the SeparateCommands function which supports
+// pipelines. This is the preferred function for parsing command strings.
+func TestSeparateCommands(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantCmds  []CommandSegment
+		wantPipes int
+	}{
+		{
+			name:      "single bare command",
+			input:     "ls",
+			wantCmds:  []CommandSegment{{Base: "ls", Argv: []string{}}},
+			wantPipes: 0,
+		},
+		{
+			name:      "command with plain args",
+			input:     "git --no-pager log --oneline",
+			wantCmds:  []CommandSegment{{Base: "git", Argv: []string{"--no-pager", "log", "--oneline"}}},
+			wantPipes: 0,
+		},
+		{
+			name:  "two-segment pipeline",
+			input: "ls -la | grep foo",
+			wantCmds: []CommandSegment{
+				{Base: "ls", Argv: []string{"-la"}},
+				{Base: "grep", Argv: []string{"foo"}},
+			},
+			wantPipes: 1,
+		},
+		{
+			name:  "three-segment pipeline",
+			input: "git --no-pager ls-files | grep README | wc -l",
+			wantCmds: []CommandSegment{
+				{Base: "git", Argv: []string{"--no-pager", "ls-files"}},
+				{Base: "grep", Argv: []string{"README"}},
+				{Base: "wc", Argv: []string{"-l"}},
+			},
+			wantPipes: 2,
+		},
+		{
+			name:  "quoted args in pipeline",
+			input: `git commit -m "hello world" | cat`,
+			wantCmds: []CommandSegment{
+				{Base: "git", Argv: []string{"commit", "-m", "hello world"}},
+				{Base: "cat", Argv: []string{}},
+			},
+			wantPipes: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cs, err := SeparateCommands(tc.input)
+			if err != nil {
+				t.Fatalf("SeparateCommands(%q): unexpected error: %v", tc.input, err)
+			}
+			if cs.Pipes != tc.wantPipes {
+				t.Errorf("Pipes: got %d, want %d", cs.Pipes, tc.wantPipes)
+			}
+			if len(cs.Segments) != len(tc.wantCmds) {
+				t.Fatalf("Segments: got %d, want %d", len(cs.Segments), len(tc.wantCmds))
+			}
+			for i, want := range tc.wantCmds {
+				got := cs.Segments[i]
+				if got.Base != want.Base {
+					t.Errorf("segment %d base: got %q, want %q", i, got.Base, want.Base)
+				}
+				if !stringSlicesEqual(got.Argv, want.Argv) {
+					t.Errorf("segment %d argv: got %#v, want %#v", i, got.Argv, want.Argv)
+				}
+			}
+		})
+	}
+}
+
+func TestSeparateCommands_Errors(t *testing.T) {
+	t.Run("empty input returns error", func(t *testing.T) {
+		_, err := SeparateCommands("")
+		if err == nil {
+			t.Fatal("expected error on empty input")
+		}
+	})
+
+	t.Run("forbidden char returns lex error", func(t *testing.T) {
+		_, err := SeparateCommands("ls > out.txt")
+		if err == nil {
+			t.Fatal("expected error on forbidden char")
+		}
+		var lerr *lex.Error
+		if !errors.As(err, &lerr) {
+			t.Fatalf("expected *lex.Error, got %T", err)
+		}
+	})
+}
+
+// TestJoinCommands tests the JoinCommands function which converts a
+// CommandSet back into a command string.
+func TestJoinCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		cs   CommandSet
+		want string
+	}{
+		{
+			name: "single command",
+			cs: CommandSet{
+				Segments: []CommandSegment{{Base: "ls", Argv: []string{"-la"}}},
+				Pipes:    0,
+			},
+			want: "ls -la",
+		},
+		{
+			name: "two-segment pipeline",
+			cs: CommandSet{
+				Segments: []CommandSegment{
+					{Base: "ls", Argv: []string{"-la"}},
+					{Base: "grep", Argv: []string{"foo"}},
+				},
+				Pipes: 1,
+			},
+			want: "ls -la | grep foo",
+		},
+		{
+			name: "three-segment pipeline",
+			cs: CommandSet{
+				Segments: []CommandSegment{
+					{Base: "git", Argv: []string{"--no-pager", "ls-files"}},
+					{Base: "grep", Argv: []string{"README"}},
+					{Base: "wc", Argv: []string{"-l"}},
+				},
+				Pipes: 2,
+			},
+			want: "git --no-pager ls-files | grep README | wc -l",
+		},
+		{
+			name: "quoted args",
+			cs: CommandSet{
+				Segments: []CommandSegment{
+					{Base: "git", Argv: []string{"commit", "-m", "hello world"}},
+					{Base: "cat", Argv: []string{}},
+				},
+				Pipes: 1,
+			},
+			want: `git commit -m "hello world" | cat`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := JoinCommands(tc.cs)
+			if got != tc.want {
+				t.Errorf("JoinCommands: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestArgvRoundTrip locks in the inverse property: for any argv shape
 // JoinArgv produces, SeparateCommand returns the original (base, argv).
 // This is the contract callers rely on when moving between the two
@@ -370,6 +548,242 @@ func TestArgvRoundTrip(t *testing.T) {
 			if !stringSlicesEqual(gotArgv, wantArgv) {
 				t.Errorf("argv mismatch: joined=%q\n  got:  %#v\n  want: %#v",
 					joined, gotArgv, wantArgv)
+			}
+		})
+	}
+}
+
+// TestCommandSetRoundTrip locks in the inverse property: for any
+// CommandSet, JoinCommands produces a string that SeparateCommands
+// can parse back into the original CommandSet.
+func TestCommandSetRoundTrip(t *testing.T) {
+	cases := []CommandSet{
+		{
+			Segments: []CommandSegment{{Base: "ls", Argv: []string{"-la"}}},
+			Pipes:    0,
+		},
+		{
+			Segments: []CommandSegment{
+				{Base: "ls", Argv: []string{"-la"}},
+				{Base: "grep", Argv: []string{"foo"}},
+			},
+			Pipes: 1,
+		},
+		{
+			Segments: []CommandSegment{
+				{Base: "git", Argv: []string{"--no-pager", "ls-files"}},
+				{Base: "grep", Argv: []string{"README"}},
+				{Base: "wc", Argv: []string{"-l"}},
+			},
+			Pipes: 2,
+		},
+		{
+			Segments: []CommandSegment{
+				{Base: "git", Argv: []string{"commit", "-m", "hello world"}},
+				{Base: "cat", Argv: []string{}},
+			},
+			Pipes: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.Segments[0].Base, func(t *testing.T) {
+			joined := JoinCommands(tc)
+			got, err := SeparateCommands(joined)
+			if err != nil {
+				t.Fatalf("round-trip failed: JoinCommands → %q, SeparateCommands error: %v", joined, err)
+			}
+			if got.Pipes != tc.Pipes {
+				t.Errorf("Pipes mismatch: got %d, want %d", got.Pipes, tc.Pipes)
+			}
+			if len(got.Segments) != len(tc.Segments) {
+				t.Fatalf("Segments count mismatch: got %d, want %d", len(got.Segments), len(tc.Segments))
+			}
+			for i, want := range tc.Segments {
+				got := got.Segments[i]
+				if got.Base != want.Base {
+					t.Errorf("segment %d base mismatch: got %q, want %q", i, got.Base, want.Base)
+				}
+				if !stringSlicesEqual(got.Argv, want.Argv) {
+					t.Errorf("segment %d argv mismatch: got %#v, want %#v", i, got.Argv, want.Argv)
+				}
+			}
+		})
+	}
+}
+
+// TestParseCommandSet_SinglePass tests that a single-segment CommandSet
+// that passes the policy returns Pass=true.
+func TestParseCommandSet_SinglePass(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("ls -la")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if !r.Pass {
+		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
+	}
+	if r.Rule != "ReadCodebase" {
+		t.Errorf("Rule = %q, want %q", r.Rule, "ReadCodebase")
+	}
+}
+
+// TestParseCommandSet_SingleFail tests that a single-segment CommandSet
+// that fails the policy returns Pass=false.
+func TestParseCommandSet_SingleFail(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("tail -f /var/log/syslog")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if r.Pass {
+		t.Fatal("expected Pass=false")
+	}
+	var me *match.Error
+	if !errors.As(r.Reason, &me) {
+		t.Fatalf("expected *match.Error, got %T", r.Reason)
+	}
+	if me.Code != match.ErrArgDenied {
+		t.Errorf("Code = %q, want %q", me.Code, match.ErrArgDenied)
+	}
+	if me.Token != "-f" {
+		t.Errorf("Token = %q, want %q", me.Token, "-f")
+	}
+}
+
+// TestParseCommandSet_PipelineAllPass tests that a multi-segment pipeline
+// where every segment passes the policy returns Pass=true.
+func TestParseCommandSet_PipelineAllPass(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("ls -la | grep foo")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if !r.Pass {
+		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
+	}
+}
+
+// TestParseCommandSet_PipelineSecondFail tests that a multi-segment pipeline
+// where the first segment passes but the second fails returns Pass=false.
+func TestParseCommandSet_PipelineSecondFail(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("ls -la | grep -f patterns.txt")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if r.Pass {
+		t.Fatal("expected Pass=false")
+	}
+	var me *match.Error
+	if !errors.As(r.Reason, &me) {
+		t.Fatalf("expected *match.Error, got %T", r.Reason)
+	}
+	if me.Code != match.ErrArgDenied {
+		t.Errorf("Code = %q, want %q", me.Code, match.ErrArgDenied)
+	}
+	if me.Token != "-f" {
+		t.Errorf("Token = %q, want %q", me.Token, "-f")
+	}
+}
+
+// TestParseCommandSet_EmptyCommandSet tests that an empty CommandSet
+// returns a clear error.
+func TestParseCommandSet_EmptyCommandSet(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs := CommandSet{Segments: []CommandSegment{}}
+	r := p.ParseCommandSet(yaml, cs)
+	if r.Pass {
+		t.Fatal("expected Pass=false for empty CommandSet")
+	}
+	if r.Reason == nil {
+		t.Fatal("expected non-nil Reason for empty CommandSet")
+	}
+	if !strings.Contains(r.Reason.Error(), "empty") {
+		t.Errorf("expected error message to mention 'empty', got: %v", r.Reason)
+	}
+}
+
+// TestParseCommandSet_PipelineThreeSegments tests a three-segment pipeline.
+func TestParseCommandSet_PipelineThreeSegments(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("git --no-pager ls-files | grep README | wc -l")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if !r.Pass {
+		t.Fatalf("expected Pass=true, got false: %v", r.Reason)
+	}
+}
+
+// TestParseCommandSet_PipelineMiddleFail tests a three-segment pipeline
+// where the middle segment fails.
+func TestParseCommandSet_PipelineMiddleFail(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cs, err := SeparateCommands("git --no-pager ls-files | grep --include-from=ignore.txt | wc -l")
+	if err != nil {
+		t.Fatalf("SeparateCommands: unexpected error: %v", err)
+	}
+	r := p.ParseCommandSet(yaml, cs)
+	if r.Pass {
+		t.Fatal("expected Pass=false")
+	}
+	var me *match.Error
+	if !errors.As(r.Reason, &me) {
+		t.Fatalf("expected *match.Error, got %T", r.Reason)
+	}
+	if me.Code != match.ErrArgDenied {
+		t.Errorf("Code = %q, want %q", me.Code, match.ErrArgDenied)
+	}
+	if me.Token != "--include-from=ignore.txt" {
+		t.Errorf("Token = %q, want %q", me.Token, "--include-from=ignore.txt")
+	}
+}
+
+// TestParseCommandSet_IntegrationWithSeparateCommands tests the full
+// round-trip: SeparateCommands → ParseCommandSet.
+func TestParseCommandSet_IntegrationWithSeparateCommands(t *testing.T) {
+	p := mustParser(t)
+	yaml := mustReadYAML(t)
+	cases := []struct {
+		input     string
+		wantPass  bool
+		wantToken string // token that should be denied, if any
+	}{
+		{"ls -la", true, ""},
+		{"git --no-pager log --oneline", true, ""},
+		{"ls -la | grep foo", true, ""},
+		{"ls -la | grep -f patterns.txt", false, "-f"},
+		{"tail -f /var/log/syslog", false, "-f"},
+		{"find . -delete", false, "-delete"},         // matcher denial
+		{"find . -delete | wc -l", false, "-delete"}, // fails on first segment
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			cs, err := SeparateCommands(tc.input)
+			if err != nil {
+				t.Fatalf("SeparateCommands(%q): unexpected error: %v", tc.input, err)
+			}
+			r := p.ParseCommandSet(yaml, cs)
+			if r.Pass != tc.wantPass {
+				t.Errorf("Pass = %v, want %v (reason: %v)", r.Pass, tc.wantPass, r.Reason)
+			}
+			if !tc.wantPass && tc.wantToken != "" {
+				var me *match.Error
+				if errors.As(r.Reason, &me) && me.Token != tc.wantToken {
+					t.Errorf("Token = %q, want %q", me.Token, tc.wantToken)
+				}
 			}
 		})
 	}

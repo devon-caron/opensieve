@@ -143,6 +143,9 @@ func (p *Parser) load(toolData []byte) (*loadedSpec, error) {
 // When both base and argv are empty, the result is the empty string so
 // that lex.Tokenize surfaces ErrEmptyInput rather than emitting a
 // quoted-empty-string token.
+//
+// Deprecated: use JoinCommands for pipelines support. JoinArgv still
+// works for single-segment commands.
 func JoinArgv(base string, argv []string) string {
 	if base == "" && len(argv) == 0 {
 		return ""
@@ -163,10 +166,12 @@ func JoinArgv(base string, argv []string) string {
 //
 // SeparateCommand handles a single command segment only. If cmd
 // contains a pipe operator, it returns ErrPipeInSingleCommand;
-// callers with pipelines should split into segments first (or call
-// Parser.Parse, which handles pipelines internally). Lexer errors
-// (forbidden chars, unterminated quotes, empty input, etc.) are
-// returned verbatim.
+// callers with pipelines should use SeparateCommands instead.
+// Lexer errors (forbidden chars, unterminated quotes, empty input, etc.)
+// are returned verbatim.
+//
+// Deprecated: use SeparateCommands for pipelines support. SeparateCommand
+// still works for single-segment commands.
 func SeparateCommand(cmd string) (base string, argv []string, err error) {
 	tokens, err := lex.Tokenize(cmd)
 	if err != nil {
@@ -190,12 +195,184 @@ func SeparateCommand(cmd string) (base string, argv []string, err error) {
 
 // ErrPipeInSingleCommand is returned by SeparateCommand when its input
 // contains a pipe operator. SeparateCommand handles a single segment
-// only; callers expecting pipelines should route through Parser.Parse
-// (which handles segmentation internally) or split the input into
-// segments and call SeparateCommand on each.
+// only; callers expecting pipelines should use SeparateCommands instead.
 var ErrPipeInSingleCommand = errors.New(
-	"opensieve: SeparateCommand received a pipeline; use Parser.Parse " +
+	"opensieve: SeparateCommand received a pipeline; use SeparateCommands " +
 		"or split into segments first")
+
+// CommandSet holds the parsed result of a command string that may contain
+// one or more pipeline segments. Each segment has its own base command and
+// arguments. The Pipes slice records the positions of pipe operators between
+// segments (len(Pipes) == len(Segments) - 1 for valid pipelines).
+//
+// For a single-segment command (no pipes), Segments has one entry and
+// Pipes is nil/empty.
+//
+// CommandSet is the inverse of JoinCommands: for any CommandSet whose
+// JoinCommands result tokenizes cleanly, SeparateCommands(JoinCommands(cs))
+// returns the original CommandSet.
+type CommandSet struct {
+	// Segments holds each command segment (one per pipeline stage).
+	// Each segment has a base command and its arguments.
+	Segments []CommandSegment
+
+	// Pipes records the number of pipe operators in the command.
+	// For n segments, there are n-1 pipes. This field is provided
+	// for convenience so callers don't need to derive it from Segments.
+	Pipes int
+}
+
+// CommandSegment represents a single command within a pipeline.
+// It has a base command name and a list of arguments.
+type CommandSegment struct {
+	// Base is the command name (e.g., "ls", "git").
+	Base string
+
+	// Argv is the list of arguments following the base command.
+	Argv []string
+}
+
+// SeparateCommands parses a command string into a CommandSet, supporting
+// pipelines. It is the inverse of JoinCommands: for any CommandSet whose
+// JoinCommands result tokenizes cleanly, SeparateCommands(JoinCommands(cs))
+// returns the original CommandSet.
+//
+// Unlike SeparateCommand (which handles only single-segment commands),
+// SeparateCommands correctly parses multi-segment pipelines by splitting
+// on pipe operators and returning a CommandSet with one segment per pipeline
+// stage.
+//
+// Lexer errors (forbidden chars, unterminated quotes, empty input, etc.)
+// are returned verbatim.
+func SeparateCommands(cmd string) (CommandSet, error) {
+	tokens, err := lex.Tokenize(cmd)
+	if err != nil {
+		return CommandSet{}, err
+	}
+
+	// Count pipes and collect word tokens per segment.
+	var segments []CommandSegment
+	var currentWords []string
+	pipeCount := 0
+
+	for _, t := range tokens {
+		switch t.Kind {
+		case lex.TokWord:
+			currentWords = append(currentWords, t.Value)
+		case lex.TokPipe:
+			// Flush current segment.
+			if len(currentWords) > 0 {
+				segments = append(segments, CommandSegment{
+					Base: currentWords[0],
+					Argv: currentWords[1:],
+				})
+			}
+			currentWords = nil
+			pipeCount++
+		case lex.TokEOF:
+			// Flush final segment.
+			if len(currentWords) > 0 {
+				segments = append(segments, CommandSegment{
+					Base: currentWords[0],
+					Argv: currentWords[1:],
+				})
+			}
+		}
+	}
+
+	if len(segments) == 0 {
+		return CommandSet{}, errors.New("opensieve: no commands found")
+	}
+
+	return CommandSet{
+		Segments: segments,
+		Pipes:    pipeCount,
+	}, nil
+}
+
+// JoinCommands converts a CommandSet back into a command string.
+// It is the inverse of SeparateCommands: for any CommandSet whose
+// JoinCommands result tokenizes cleanly, SeparateCommands(JoinCommands(cs))
+// returns the original CommandSet.
+//
+// Each segment's base and argv are joined using the same quoting logic
+// as JoinArgv, and segments are separated by pipe operators.
+func JoinCommands(cs CommandSet) string {
+	if len(cs.Segments) == 0 {
+		return ""
+	}
+
+	var parts []string
+	for i, seg := range cs.Segments {
+		if i > 0 {
+			parts = append(parts, "|")
+		}
+		// Build this segment's command string.
+		segParts := make([]string, 0, 1+len(seg.Argv))
+		segParts = append(segParts, quoteArg(seg.Base))
+		for _, a := range seg.Argv {
+			segParts = append(segParts, quoteArg(a))
+		}
+		parts = append(parts, strings.Join(segParts, " "))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// ParseCommandSet validates a CommandSet against the policy loaded from
+// toolData. Each segment in the CommandSet is matched independently in
+// order, and the result fails fast on the first segment that doesn't pass.
+//
+// This is the preferred entry point when you already have a CommandSet
+// from SeparateCommands, as it avoids the round-trip of converting back
+// to a command string and then re-parsing it.
+func (p *Parser) ParseCommandSet(toolData string, cs CommandSet) ParseResult {
+	if len(cs.Segments) == 0 {
+		return ParseResult{
+			Pass:   false,
+			Reason: errors.New("opensieve: empty CommandSet"),
+			Rule:   toolData,
+		}
+	}
+
+	ls, err := p.load([]byte(toolData))
+	if err != nil {
+		return ParseResult{
+			Pass:   false,
+			Reason: err,
+			Rule:   "Tool data: " + toolData,
+		}
+	}
+
+	ruleName := ls.spec.Name
+
+	for _, seg := range cs.Segments {
+		cmd := JoinArgv(seg.Base, seg.Argv)
+
+		tokens, err := lex.Tokenize(cmd)
+		if err != nil {
+			return ParseResult{
+				Pass:   false,
+				Reason: err,
+				Rule:   ruleName,
+			}
+		}
+
+		if _, err := ls.matcher.Match(match.Segment{Tokens: tokens}); err != nil {
+			return ParseResult{
+				Pass:   false,
+				Reason: err,
+				Rule:   ruleName,
+			}
+		}
+	}
+
+	return ParseResult{
+		Pass:   true,
+		Reason: nil,
+		Rule:   ruleName,
+	}
+}
 
 // quoteArg wraps s in quotes whenever any of its characters would not
 // survive the lexer as part of a single unquoted word. The intent is
